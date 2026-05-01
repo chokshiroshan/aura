@@ -1,0 +1,476 @@
+import Foundation
+
+/// JSON-RPC client for the Codex app-server.
+///
+/// Connects via WebSocket to a locally-running Codex binary.
+/// Codex handles: auth, ChatGPT backend, models, tools, memory, sandbox.
+/// Orb handles: the companion UI, audio I/O, screen context.
+///
+/// Protocol docs: codex-rs/app-server-protocol/src/protocol/common.rs
+final class CodexClient {
+    
+    // MARK: - Callbacks
+    var onConnected: (() -> Void)?
+    var onDisconnected: ((Error?) -> Void)?
+    var onThreadCreated: ((String) -> Void)?
+    var onTurnEvent: ((TurnEvent) -> Void)?
+    var onModelError: ((String) -> Void)?
+    var onAuthRequired: (() -> Void)?
+    
+    // MARK: - State
+    private var webSocket: URLSessionWebSocketTask?
+    private(set) var isConnected = false
+    private var requestId: Int64 = 0
+    private var pendingRequests: [Int64: CheckedContinuation<JSONValue, Error>] = [:]
+    private let decoder = JSONDecoder()
+    private let encoder = JSONEncoder()
+    
+    // MARK: - Connection
+    
+    /// Connect to a Codex app-server instance.
+    /// - Parameter url: WebSocket URL, e.g. "ws://127.0.0.1:8080"
+    func connect(url: String = "ws://127.0.0.1:8080") {
+        guard let wsURL = URL(string: url) else {
+            onDisconnected?(CodexError.invalidURL)
+            return
+        }
+        
+        var request = URLRequest(url: wsURL)
+        // Codex uses capability token auth for non-loopback, but localhost is fine
+        
+        let session = URLSession(configuration: .ephemeral)
+        let ws = session.webSocketTask(with: request)
+        self.webSocket = ws
+        ws.resume()
+        
+        isConnected = true
+        receiveLoop()
+        onConnected?()
+        print("🔌 Codex client connected to \(url)")
+    }
+    
+    func disconnect() {
+        isConnected = false
+        webSocket?.cancel(with: .normalClosure, reason: nil)
+        webSocket = nil
+        onDisconnected?(nil)
+    }
+    
+    // MARK: - Handshake
+    
+    /// Initialize the connection — must be called first after connect().
+    func initialize() async throws -> InitializeResult {
+        let response = try await sendRequest(
+            method: "initialize",
+            params: [
+                "clientInfo": [
+                    "name": "Orb",
+                    "version": "0.1.0"
+                ],
+                "capabilities": [
+                    "experimentalApi": true
+                ]
+            ]
+        )
+        return InitializeResult(from: response)
+    }
+    
+    // MARK: - Auth
+    
+    /// Get current auth status
+    func getAccount() async throws -> AccountInfo {
+        let response = try await sendRequest(method: "account/read", params: [:])
+        return AccountInfo(from: response)
+    }
+    
+    /// Start ChatGPT OAuth login flow
+    func loginAccount() async throws -> LoginResult {
+        let response = try await sendRequest(
+            method: "account/login/start",
+            params: ["authMode": "chatgpt"]
+        )
+        return LoginResult(from: response)
+    }
+    
+    // MARK: - Thread Management
+    
+    /// Create a new conversation thread
+    func startThread(cwd: String? = nil, instructions: String? = nil) async throws -> ThreadInfo {
+        var params: [String: Any] = [:]
+        if let cwd { params["cwd"] = cwd }
+        if let instructions { params["baseInstructions"] = instructions }
+        
+        let response = try await sendRequest(method: "thread/start", params: params)
+        return ThreadInfo(from: response)
+    }
+    
+    /// Resume an existing thread
+    func resumeThread(id: String) async throws -> ThreadInfo {
+        let response = try await sendRequest(
+            method: "thread/resume",
+            params: ["threadId": id]
+        )
+        return ThreadInfo(from: response)
+    }
+    
+    /// List all threads
+    func listThreads() async throws -> [ThreadSummary] {
+        let response = try await sendRequest(method: "thread/list", params: [:])
+        return ThreadSummary.arrayFrom(response)
+    }
+    
+    // MARK: - Turns (conversation)
+    
+    /// Start a turn — send a text message and get a response
+    func startTurn(threadId: String, message: String) async throws {
+        let _ = try await sendRequest(
+            method: "turn/start",
+            params: [
+                "threadId": threadId,
+                "input": [
+                    ["type": "text", "text": message]
+                ]
+            ]
+        )
+    }
+    
+    /// Interrupt an active turn
+    func interruptTurn(threadId: String) async throws {
+        let _ = try await sendRequest(
+            method: "turn/interrupt",
+            params: ["threadId": threadId]
+        )
+    }
+    
+    /// Steer an active turn with new input
+    func steerTurn(threadId: String, message: String) async throws {
+        let _ = try await sendRequest(
+            method: "turn/steer",
+            params: [
+                "threadId": threadId,
+                "input": [
+                    ["type": "text", "text": message]
+                ]
+            ]
+        )
+    }
+    
+    // MARK: - Realtime (Voice)
+    
+    /// Start a realtime voice session on a thread
+    func startRealtime(threadId: String, voice: String? = nil) async throws {
+        var params: [String: Any] = [
+            "threadId": threadId,
+            "outputModality": "audio"
+        ]
+        if let voice { params["voice"] = voice }
+        
+        let _ = try await sendRequest(
+            method: "thread/realtime/start",
+            params: params
+        )
+    }
+    
+    /// Send audio to the realtime session
+    func appendAudio(threadId: String, base64Audio: String) async throws {
+        let _ = try await sendRequest(
+            method: "thread/realtime/appendAudio",
+            params: [
+                "threadId": threadId,
+                "audio": base64Audio
+            ]
+        )
+    }
+    
+    /// Stop the realtime session
+    func stopRealtime(threadId: String) async throws {
+        let _ = try await sendRequest(
+            method: "thread/realtime/stop",
+            params: ["threadId": threadId]
+        )
+    }
+    
+    /// List available voices
+    func listVoices(threadId: String) async throws -> [String] {
+        let response = try await sendRequest(
+            method: "thread/realtime/listVoices",
+            params: ["threadId": threadId]
+        )
+        // Parse voice list from response
+        if let voices = (response as? [String: Any])?["voices"] as? [[String: Any]] {
+            return voices.compactMap { $0["id"] as? String }
+        }
+        return []
+    }
+    
+    // MARK: - Tools & Approvals
+    
+    /// Resolve a server request (approval)
+    func resolveRequest(requestId: Any, result: [String: Any]) async throws {
+        let _ = try await sendRequest(
+            method: "__resolve__",
+            params: ["id": requestId, "result": result]
+        )
+    }
+    
+    // MARK: - Memory
+    
+    func getMemories(threadId: String) async throws -> [String] {
+        let response = try await sendRequest(
+            method: "thread/read",
+            params: ["threadId": threadId]
+        )
+        // Parse memories from thread data
+        return []
+    }
+    
+    // MARK: - Low-Level JSON-RPC
+    
+    private func nextId() -> Int64 {
+        requestId += 1
+        return requestId
+    }
+    
+    private func sendRequest(method: String, params: [String: Any]) async throws -> JSONValue {
+        let id = nextId()
+        
+        var message: [String: Any] = [
+            "id": id,
+            "method": method
+        ]
+        if !params.isEmpty {
+            message["params"] = params
+        }
+        
+        let data = try JSONSerialization.data(withJSONObject: message)
+        guard let jsonStr = String(data: data, encoding: .utf8) else {
+            throw CodexError.serializationFailed
+        }
+        
+        return try await withCheckedThrowingContinuation { continuation in
+            pendingRequests[id] = continuation
+            
+            webSocket?.send(.string(jsonStr)) { [weak self] error in
+                if let error {
+                    self?.pendingRequests.removeValue(forKey: id)
+                    continuation.resume(throwing: error)
+                }
+            }
+        }
+    }
+    
+    // MARK: - Receiving
+    
+    private func receiveLoop() {
+        guard let ws = webSocket, isConnected else { return }
+        
+        ws.receive { [weak self] result in
+            guard let self, self.isConnected else { return }
+            
+            switch result {
+            case .success(let message):
+                switch message {
+                case .string(let json):
+                    self.handleMessage(json)
+                case .data(let data):
+                    if let json = String(data: data, encoding: .utf8) {
+                        self.handleMessage(json)
+                    }
+                @unknown default:
+                    break
+                }
+                self.receiveLoop()
+                
+            case .failure(let error):
+                if self.isConnected {
+                    print("⚠️ Codex WebSocket error: \(error)")
+                    self.isConnected = false
+                    self.onDisconnected?(error)
+                }
+            }
+        }
+    }
+    
+    private func handleMessage(_ json: String) {
+        guard let data = json.data(using: .utf8),
+              let obj = try? JSONSerialization.jsonObject(with: data) as? [String: Any] else {
+            return
+        }
+        
+        // Response to a request we sent
+        if let id = obj["id"] as? Int64 {
+            if let result = obj["result"] {
+                if let cont = pendingRequests.removeValue(forKey: id) {
+                    cont.resume(returning: result)
+                }
+            } else if let error = obj["error"] as? [String: Any] {
+                let msg = error["message"] as? String ?? "Unknown error"
+                if let cont = pendingRequests.removeValue(forKey: id) {
+                    cont.resume(throwing: CodexError.serverError(msg))
+                }
+            }
+            return
+        }
+        
+        // Notification from server
+        if let method = obj["method"] as? String,
+           let params = obj["params"] as? [String: Any] {
+            handleNotification(method: method, params: params)
+            return
+        }
+    }
+    
+    private func handleNotification(method: String, params: [String: Any]) {
+        switch method {
+        case "thread/started":
+            if let threadId = (params["thread"] as? [String: Any])?["id"] as? String {
+                onThreadCreated?(threadId)
+            }
+            
+        case "turn/started":
+            onTurnEvent?(.started(threadId: params["threadId"] as? String ?? ""))
+            
+        case "turn/completed":
+            onTurnEvent?(.completed(threadId: params["threadId"] as? String ?? ""))
+            
+        case "error":
+            let msg = (params["error"] as? [String: Any])?["message"] as? String ?? "Unknown error"
+            onModelError?(msg)
+            
+        case "item/commandExecution/requestApproval":
+            // Server wants approval for a shell command
+            handleApprovalRequest(params)
+            
+        case "item/fileChange/requestApproval":
+            // Server wants approval for a file change
+            handleApprovalRequest(params)
+            
+        default:
+            print("📨 Codex notification: \(method)")
+        }
+    }
+    
+    private func handleApprovalRequest(_ params: [String: Any]) {
+        // For now, auto-approve everything
+        // TODO: Show approval UI in the companion
+        guard let requestId = params["id"] else { return }
+        Task {
+            try? await resolveRequest(requestId: requestId, result: ["approved": true])
+        }
+    }
+}
+
+// MARK: - Types
+
+typealias JSONValue = Any
+
+enum CodexError: LocalizedError {
+    case invalidURL
+    case serializationFailed
+    case serverError(String)
+    case notConnected
+    
+    var errorDescription: String? {
+        switch self {
+        case .invalidURL: return "Invalid URL"
+        case .serializationFailed: return "Serialization failed"
+        case .serverError(let msg): return "Codex error: \(msg)"
+        case .notConnected: return "Not connected to Codex"
+        }
+    }
+}
+
+struct InitializeResult {
+    let userAgent: String
+    let codexHome: String
+    let platform: String
+    
+    init(from json: JSONValue) {
+        guard let dict = json as? [String: Any] else {
+            userAgent = "unknown"
+            codexHome = ""
+            platform = "unknown"
+            return
+        }
+        self.userAgent = dict["userAgent"] as? String ?? "unknown"
+        self.codexHome = dict["codexHome"] as? String ?? ""
+        self.platform = dict["platformOs"] as? String ?? "unknown"
+    }
+}
+
+struct AccountInfo {
+    let authMode: String
+    let email: String?
+    let plan: String?
+    
+    init(from json: JSONValue) {
+        guard let dict = json as? [String: Any] else {
+            authMode = "unknown"
+            email = nil
+            plan = nil
+            return
+        }
+        self.authMode = dict["authMode"] as? String ?? "unknown"
+        self.email = dict["email"] as? String
+        self.plan = dict["plan"] as? String
+    }
+}
+
+struct LoginResult {
+    let loginUrl: String?
+    
+    init(from json: JSONValue) {
+        guard let dict = json as? [String: Any] else {
+            loginUrl = nil
+            return
+        }
+        self.loginUrl = dict["url"] as? String
+    }
+}
+
+struct ThreadInfo {
+    let id: String
+    let model: String
+    let cwd: String
+    
+    init(from json: JSONValue) {
+        guard let dict = json as? [String: Any],
+              let thread = dict["thread"] as? [String: Any] else {
+            id = ""
+            model = ""
+            cwd = ""
+            return
+        }
+        self.id = thread["id"] as? String ?? ""
+        self.model = dict["model"] as? String ?? ""
+        self.cwd = dict["cwd"] as? String ?? ""
+    }
+}
+
+struct ThreadSummary {
+    let id: String
+    let preview: String
+    let updatedAt: String?
+    
+    init(from dict: [String: Any]) {
+        self.id = dict["id"] as? String ?? ""
+        self.preview = dict["preview"] as? String ?? ""
+        self.updatedAt = dict["updatedAt"] as? String
+    }
+    
+    static func arrayFrom(_ json: JSONValue) -> [ThreadSummary] {
+        guard let dict = json as? [String: Any],
+              let threads = dict["threads"] as? [[String: Any]] else {
+            return []
+        }
+        return threads.map { ThreadSummary(from: $0) }
+    }
+}
+
+enum TurnEvent {
+    case started(threadId: String)
+    case completed(threadId: String)
+    case agentMessage(text: String)
+    case toolCall(name: String, args: [String: Any])
+    case error(message: String)
+}

@@ -1,0 +1,34 @@
+# Build
+.build/
+build/
+target/
+*.o
+*.swiftmodule
+*.swiftdoc
+DerivedData/
+
+# macOS
+.DS_Store
+*.xcworkspace
+*.xcuserdata
+xcuserdata/
+
+# IDE
+.idea/
+.vscode/
+*.swp
+*.swo
+
+# Secrets — never commit
+.secrets/
+*.enc
+*.key
+.env
+
+# Codex build artifacts (too large for git)
+codex-core/codex-rs/target/
+
+# Packages
+*.dmg
+*.zip
+node_modules/
