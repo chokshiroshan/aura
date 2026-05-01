@@ -7,7 +7,7 @@ let package = Package(
     targets: [
         .executableTarget(
             name: "Orb",
-            path: "Sources/Orb",
+            path: "Sources/Aura",
             resources: [
                 .process("Resources")
             ]

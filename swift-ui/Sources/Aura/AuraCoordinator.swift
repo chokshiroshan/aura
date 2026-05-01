@@ -5,7 +5,7 @@ import Combine
 ///
 /// Architecture:
 /// ```
-/// Orb App (.app bundle)
+/// Aura App (.app bundle)
 /// ├── Swift UI (this file, audio, companion)
 /// │     ↕ JSON-RPC over WebSocket
 /// └── Codex binary (launched as background process)
@@ -13,8 +13,8 @@ import Combine
 ///       GPT-5 / gpt-realtime (free via subscription)
 /// ```
 @MainActor
-final class OrbCoordinator: ObservableObject {
-    @Published var orbState: OrbState = .idle
+final class AuraCoordinator: ObservableObject {
+    @Published var orbState: AuraState = .idle
     @Published var connectionState: ConnectionState = .disconnected
     @Published var currentThreadId: String?
     @Published var accountEmail: String?
@@ -151,7 +151,7 @@ final class OrbCoordinator: ObservableObject {
                 let thread = try await codex.startThread(
                     cwd: NSHomeDirectory(),
                     instructions: """
-                    You are Orb, a helpful AI companion that lives on the user's desktop.
+                    You are Aura, a helpful AI companion that lives on the user's desktop.
                     You can see their screen, hear their voice, and help with any task.
                     Be concise, friendly, and proactive. Use tools when helpful.
                     """
@@ -282,7 +282,7 @@ final class OrbCoordinator: ObservableObject {
 
 // MARK: - Types
 
-enum OrbState {
+enum AuraState {
     case idle
     case listening
     case processing

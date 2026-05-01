@@ -1,8 +1,8 @@
 import SwiftUI
 
-/// Glowing orb companion — the visual face of Orb.
+/// Glowing orb companion — the visual face of Aura.
 /// Pulses, changes color with state, reacts to interaction.
-struct OrbCompanionView: View {
+struct AuraCompanionView: View {
     @State private var breathScale: CGFloat = 1.0
     @State private var glowRadius: CGFloat = 30
     @State private var ringRotation: Double = 0
@@ -140,7 +140,7 @@ struct OrbCompanionView: View {
 
     // MARK: - State Colors
 
-    private func updateColor(for state: OrbState) {
+    private func updateColor(for state: AuraState) {
         withAnimation(.easeInOut(duration: 0.5)) {
             switch state {
             case .idle:       orbColor = .orbIdle
@@ -153,7 +153,7 @@ struct OrbCompanionView: View {
     }
 }
 
-// MARK: - Orb Colors
+// MARK: - Companion Orb Colors
 
 extension Color {
     static let orbIdle       = Color(hex: "6C63FF") // Purple

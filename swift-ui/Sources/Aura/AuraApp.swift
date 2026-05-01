@@ -1,7 +1,7 @@
 import SwiftUI
 
 @main
-struct OrbApp: App {
+struct AuraApp: App {
     @NSApplicationDelegateAdaptor(AppDelegate.self) var delegate
 
     var body: some Scene {
@@ -14,7 +14,7 @@ struct OrbApp: App {
 // MARK: - App Delegate
 
 final class AppDelegate: NSObject, NSApplicationHandler {
-    let coordinator = OrbCoordinator()
+    let coordinator = AuraCoordinator()
 
     func applicationDidFinishLaunching(_ notification: Notification) {
         // Spawn the floating companion on every screen

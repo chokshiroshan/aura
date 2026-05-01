@@ -22,7 +22,7 @@ struct SetupView: View {
                     )
                     .frame(width: 60, height: 60)
 
-                Text("Orb")
+                Text("Aura")
                     .font(.system(size: 28, weight: .bold, design: .rounded))
 
                 Text("Your AI companion, everywhere.")
@@ -83,7 +83,7 @@ struct SetupView: View {
 
     private func connect() {
         isConnecting = true
-        // TODO: Wire to OrbCoordinator
+        // TODO: Wire to AuraCoordinator
     }
 }
 

@@ -16,7 +16,7 @@ final class CompanionWindowController {
 }
 
 private final class CompanionPanel: NSPanel {
-    private let hostingView: NSHostingView<OrbCompanionView>
+    private let hostingView: NSHostingView<AuraCompanionView>
 
     init(for screen: NSScreen) {
         let size = CGSize(width: 100, height: 100)
@@ -25,7 +25,7 @@ private final class CompanionPanel: NSPanel {
             y: screen.visibleFrame.minY + 16
         )
 
-        self.hostingView = NSHostingView(rootView: OrbCompanionView())
+        self.hostingView = NSHostingView(rootView: AuraCompanionView())
 
         super.init(
             contentRect: NSRect(origin: origin, size: size),

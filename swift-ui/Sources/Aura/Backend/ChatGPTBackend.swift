@@ -4,7 +4,7 @@ import Foundation
 /// No OpenClaw needed. Local memory only.
 ///
 /// This is the "it just works" path for people who don't have OpenClaw.
-final class ChatGPTBackend: OrbBackend {
+final class ChatGPTBackend: AuraBackend {
     var onConnected: (() -> Void)?
     var onError: ((Error) -> Void)?
     var onAudioResponse: (() -> Void)?

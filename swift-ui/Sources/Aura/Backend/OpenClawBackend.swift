@@ -6,7 +6,7 @@ import Foundation
 /// Setup: user provides their gateway URL + API key (or scans QR from OpenClaw).
 ///
 /// Communication: REST API for text, WebSocket for real-time voice.
-final class OpenClawBackend: OrbBackend {
+final class OpenClawBackend: AuraBackend {
     var onConnected: (() -> Void)?
     var onError: ((Error) -> Void)?
     var onAudioResponse: (() -> Void)?
@@ -163,7 +163,7 @@ final class OpenClawBackend: OrbBackend {
     private func handleWebSocketMessage(_ text: String) {
         // Parse OpenClaw realtime response
         // Could be: transcription, LLM response, memory update, etc.
-        print("[Orb] WebSocket message: \(text.prefix(200))")
+        print("[Aura] WebSocket message: \(text.prefix(200))")
     }
 
     private func handleWebSocketData(_ data: Data) {

@@ -3,7 +3,7 @@ import Foundation
 // MARK: - Protocol
 
 /// Abstract backend — the app doesn't care whether it's OpenClaw or ChatGPT.
-protocol OrbBackend: AnyObject {
+protocol AuraBackend: AnyObject {
     var onConnected: (() -> Void)? { get set }
     var onError: ((Error) -> Void)? { get set }
     var onAudioResponse: (() -> Void)? { get set }
@@ -27,21 +27,21 @@ struct MemoryEntry: Codable, Identifiable {
     let source: String // "openclaw", "chatgpt", "local"
 }
 
-struct OrbConfig: Codable {
+struct AuraConfig: Codable {
     var backendType: String // "openclaw" | "chatgpt"
     var openclawURL: String?
     var openclawAPIKey: String?
     var lastConnected: Date?
 
-    static let storageKey = "ai.orb.desktop.config"
+    static let storageKey = "ai.aura.desktop.config"
 
-    static func load() -> OrbConfig? {
+    static func load() -> AuraConfig? {
         guard let data = UserDefaults.standard.data(forKey: storageKey) else { return nil }
-        return try? JSONDecoder().decode(OrbConfig.self, from: data)
+        return try? JSONDecoder().decode(AuraConfig.self, from: data)
     }
 
     func save() {
         guard let data = try? JSONEncoder().encode(self) else { return }
-        UserDefaults.standard.set(data, forKey: OrbConfig.storageKey)
+        UserDefaults.standard.set(data, forKey: AuraConfig.storageKey)
     }
 }

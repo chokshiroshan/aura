@@ -4,7 +4,7 @@ import Foundation
 ///
 /// Connects via WebSocket to a locally-running Codex binary.
 /// Codex handles: auth, ChatGPT backend, models, tools, memory, sandbox.
-/// Orb handles: the companion UI, audio I/O, screen context.
+/// Aura handles: the companion UI, audio I/O, screen context.
 ///
 /// Protocol docs: codex-rs/app-server-protocol/src/protocol/common.rs
 final class CodexClient {
@@ -64,7 +64,7 @@ final class CodexClient {
             method: "initialize",
             params: [
                 "clientInfo": [
-                    "name": "Orb",
+                    "name": "Aura",
                     "version": "0.1.0"
                 ],
                 "capabilities": [

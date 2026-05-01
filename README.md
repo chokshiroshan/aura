@@ -1,81 +1,77 @@
-# 🛰️ Orb
+# ✨ Aura
 
-**Your AI companion. Everywhere.**
+**Your AI companion. Always on your screen.**
 
-Built on [OpenAI Codex](https://github.com/openai/codex) (Apache 2.0).
+Aura is a persistent AI companion for macOS that sees your screen, hears your voice, understands your intent, acts on your behalf, remembers who you are, and nudges you when it has something useful.
 
-## What Orb Is
+Not a chat window. Not a terminal. A companion that participates in your work.
 
-Orb takes Codex — an open-source coding agent — and gives it a soul.
+## What Aura Does
 
-- **Floating companion** on your desktop (glowing orb, always there)
-- **Voice-first** — talk to it naturally, it talks back
-- **Full agent** — file access, shell commands, web search, code
-- **Free** — uses your existing ChatGPT subscription (Plus/Pro)
-- **OpenClaw compatible** — connect your OpenClaw instance for multi-device sync
+- **Dictates** — hold a hotkey, speak, text appears anywhere
+- **Talks** — natural voice conversation, back and forth
+- **Sees** — live screen streaming, always knows what you're looking at
+- **Acts** — runs commands, edits files, browses the web
+- **Remembers** — persists memory across sessions
+- **Nudges** — proactively offers help with visual suggestions
 
 ## How It Works
 
 ```
-Orb App (Swift UI)
-    ↓ JSON-RPC
-Codex App Server (bundled, open source)
-    ↓ ChatGPT Backend API
-GPT-4.5 / GPT-4o / gpt-realtime
-    ↑ Included in your ChatGPT subscription
+Aura App (.app bundle)
+├── Swift UI (companion, audio, screen capture)
+│     ↕ JSON-RPC over WebSocket
+└── Codex binary (bundled, open source — Apache 2.0)
+      ↕ ChatGPT Backend API
+      GPT-5 / gpt-realtime
+      ↑ Included in your ChatGPT subscription — $0 per token
 ```
 
-No API keys. No per-token charges. Just sign in with ChatGPT.
+No API keys. No per-token charges. Sign in with ChatGPT.
 
-## Structure
+## Status
 
-```
-orb/
-├── codex-core/       → Forked OpenAI Codex (Apache 2.0)
-│   └── codex-rs/     → Rust source (app-server, auth, voice, tools, memory)
-│
-└── swift-ui/         → Orb desktop companion (Swift/SwiftUI)
-    ├── Sources/Orb/  → Floating orb, setup flow, settings
-    └── build.sh      → Build .app bundle (includes codex binary)
-```
+**v0.1 — Scaffold** (current)
 
-## Setup Flow
+- [x] Swift UI companion (floating glowing orb)
+- [x] CodexClient — JSON-RPC WebSocket client for Codex backend
+- [x] AuraCoordinator — launches Codex, manages threads/voice/actions
+- [x] Codex OAuth (ChatGPT subscription auth)
+- [x] Audio capture (24kHz PCM16)
+- [x] Screen context extractor
+- [ ] Codex binary bundled in .app
+- [ ] End-to-end text chat
+- [ ] Voice conversation
+- [ ] Live screen streaming
 
-```
-First Launch:
-1. "Sign in with ChatGPT" → official OAuth
-2. Orb appears on your desktop
-3. Talk to it. Done.
-
-Optional:
-4. "Connect OpenClaw" → multi-device sync, skills, always-on agent
-```
+See [PRODUCT_SPEC.md](PRODUCT_SPEC.md) for the full vision and [BUILD_PLAN.md](BUILD_PLAN.md) for the technical plan.
 
 ## Building
 
+### Prerequisites
+
+- macOS 14+ (Sonoma)
+- Xcode Command Line Tools
+- Rust toolchain (for Codex binary)
+
+### Build Codex (Rust backend)
+
 ```bash
-# Build Codex (Rust)
-cd orb/codex-core/codex-rs
+# Clone Codex into the project
+git clone https://github.com/openai/codex.git codex-core
+cd codex-core/codex-rs
 cargo build --release -p codex-app-server
-
-# Build Orb UI (Swift, requires macOS)
-cd ../../swift-ui
-./build.sh
-
-# The .app bundles the codex binary inside
 ```
 
-## Why Fork Codex?
+### Build Aura (Swift UI)
 
-- **Official OAuth** — no hacks, no reverse engineering
-- **Free inference** — GPT-4.5, GPT-4o, voice via ChatGPT subscription
-- **Battle-tested** — millions of Codex users, OpenAI maintains it
-- **Apache 2.0** — full permission to fork, modify, distribute
-- **Rich features** — memory, tools, skills, sandboxing, already built
-
-We add: the companion UI, the always-on experience, the OpenClaw integration.
+```bash
+cd swift-ui
+./build.sh        # Build .app
+./build.sh dmg    # Build .app + DMG
+```
 
 ## License
 
+- **swift-ui/**: MIT
 - **codex-core/**: Apache 2.0 (© OpenAI)
-- **swift-ui/**: MIT (© Roshan Choks)
