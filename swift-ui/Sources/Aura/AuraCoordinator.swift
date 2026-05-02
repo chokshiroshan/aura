@@ -1,17 +1,25 @@
 import SwiftUI
 import Combine
 
-/// Central coordinator — glues companion UI, voice, Codex backend, and screen context.
+/// Central coordinator — the brain that wires everything together.
 ///
 /// Architecture:
 /// ```
 /// Aura App (.app bundle)
-/// ├── Swift UI (this file, audio, companion)
+/// ├── Swift UI (this file, companion, audio, screen)
 /// │     ↕ JSON-RPC over WebSocket
-/// └── Codex binary (launched as background process)
+/// └── Codex binary (background process)
 ///       ↕ ChatGPT Backend API
 ///       GPT-5 / gpt-realtime (free via subscription)
 /// ```
+///
+/// Manages:
+/// - Codex binary lifecycle + WebSocket connection
+/// - Thread/turn management for conversations
+/// - Voice sessions (mic → Codex → speaker)
+/// - Screen streaming (1fps → Codex vision)
+/// - Proactive nudges (scan → detect → notify)
+/// - Approval flow (command/file → UI → resolve)
 @MainActor
 final class AuraCoordinator: ObservableObject {
     @Published var orbState: AuraState = .idle
@@ -20,30 +28,50 @@ final class AuraCoordinator: ObservableObject {
     @Published var accountEmail: String?
     @Published var accountPlan: String?
     @Published var conversationHistory: [ChatMessage] = []
+    @Published var activeNudge: NudgeEngine.Nudge?
+    @Published var proactivityLevel: NudgeEngine.ProactivityLevel = .active
     
     // MARK: - Components
     private let codex = CodexClient()
-    private let screenContext = ScreenContextExtractor()
     private let audioCapture = AudioCapture()
+    private let audioPlayer = AudioPlayer()
+    private let screenStreamer = ScreenStreamer()
+    private let nudgeEngine = NudgeEngine()
     private var codexProcess: Process?
     private var cancellables = Set<AnyCancellable>()
     
+    // MARK: - State
+    private var isScreenStreaming = false
+    private var pendingApprovals: [String: [String: Any]] = [:]
+    
     // MARK: - Setup
     
-    /// Launch the bundled Codex binary and connect to it.
     func startCodexAndConnect() {
         connectionState = .connecting
         
-        // 1. Launch Codex binary as background process
+        // Wire sub-components
+        nudgeEngine.setCodexClient(codex)
+        nudgeEngine.onNudge = { [weak self] nudge in
+            Task { @MainActor in
+                self?.activeNudge = nudge
+                self?.orbState = .speaking  // Brief glow
+                DispatchQueue.main.asyncAfter(deadline: .now() + 1) {
+                    if self?.orbState == .speaking { self?.orbState = .idle }
+                }
+            }
+        }
+        
+        screenStreamer.onFrame = { [weak self] url in
+            self?.handleScreenFrame(url)
+        }
+        
         launchCodexBinary()
         
-        // 2. Wait briefly for it to start, then connect via WebSocket
         DispatchQueue.main.asyncAfter(deadline: .now() + 1.0) { [weak self] in
             self?.connectToCodex()
         }
     }
     
-    /// Connect to an already-running Codex instance
     func connectToCodex(url: String = "ws://127.0.0.1:8080") {
         setupCodexCallbacks()
         codex.connect(url: url)
@@ -52,13 +80,10 @@ final class AuraCoordinator: ObservableObject {
     private func setupCodexCallbacks() {
         codex.onConnected = { [weak self] in
             Task { @MainActor in
-                self?.connectionState = .connected
-                // Initialize the protocol
                 do {
-                    let initResult = try await self?.codex.initialize() 
-                    print("✅ Codex initialized: \(initResult?.userAgent ?? "unknown") on \(initResult?.platform ?? "?")")
+                    let initResult = try await self?.codex.initialize()
+                    print("✅ Codex initialized: \(initResult?.userAgent ?? "?")")
                     
-                    // Check if we need to log in
                     let account = try await self?.codex.getAccount()
                     self?.accountEmail = account?.email
                     self?.accountPlan = account?.plan
@@ -67,11 +92,12 @@ final class AuraCoordinator: ObservableObject {
                         self?.connectionState = .authenticating
                         self?.codex.onAuthRequired?()
                     } else {
-                        // Ready to use
+                        self?.connectionState = .connected
                         self?.createOrResumeThread()
+                        self?.startScreenStreaming()
+                        self?.nudgeEngine.startScanning()
                     }
                 } catch {
-                    print("❌ Codex init failed: \(error)")
                     self?.connectionState = .error(error.localizedDescription)
                 }
             }
@@ -80,7 +106,6 @@ final class AuraCoordinator: ObservableObject {
         codex.onDisconnected = { [weak self] error in
             Task { @MainActor in
                 self?.connectionState = .disconnected
-                if let error { print("⚠️ Codex disconnected: \(error)") }
             }
         }
         
@@ -107,27 +132,19 @@ final class AuraCoordinator: ObservableObject {
     // MARK: - Codex Binary
     
     private func launchCodexBinary() {
-        // Path to bundled Codex binary inside the .app
         let bundle = Bundle.main
         let codexPath = bundle.path(forResource: "codex-app-server", ofType: nil)
             ?? bundle.path(forResource: "codex-app-server", ofType: nil, inDirectory: "Contents/MacOS")
         
         guard let binaryPath = codexPath else {
-            print("❌ Codex binary not found in app bundle")
             connectionState = .error("Codex binary not found")
             return
         }
         
         let process = Process()
         process.executableURL = URL(fileURLWithPath: binaryPath)
+        process.arguments = ["--listen", "ws://127.0.0.1:8080", "--session-source", "aura"]
         
-        // Launch with WebSocket transport on localhost
-        process.arguments = [
-            "--listen", "ws://127.0.0.1:8080",
-            "--session-source", "orb"
-        ]
-        
-        // Redirect stdout/stderr to /dev/null (Codex is a daemon)
         let pipe = Pipe()
         process.standardOutput = pipe
         process.standardError = pipe
@@ -135,9 +152,8 @@ final class AuraCoordinator: ObservableObject {
         do {
             try process.run()
             self.codexProcess = process
-            print("🚀 Codex binary launched (PID: \(process.processIdentifier))")
+            print("🚀 Codex launched (PID: \(process.processIdentifier))")
         } catch {
-            print("❌ Failed to launch Codex: \(error)")
             connectionState = .error("Failed to launch Codex: \(error.localizedDescription)")
         }
     }
@@ -147,20 +163,21 @@ final class AuraCoordinator: ObservableObject {
     private func createOrResumeThread() {
         Task {
             do {
-                // Create a new thread for this session
                 let thread = try await codex.startThread(
                     cwd: NSHomeDirectory(),
                     instructions: """
-                    You are Aura, a helpful AI companion that lives on the user's desktop.
-                    You can see their screen, hear their voice, and help with any task.
+                    You are Aura, a persistent AI companion on the user's Mac desktop.
+                    You see their screen in real-time and hear their voice.
+                    You help with any task — coding, writing, research, debugging, brainstorming.
                     Be concise, friendly, and proactive. Use tools when helpful.
+                    
+                    You are not a chatbot. You are a companion that participates in their work.
                     """
                 )
                 self.currentThreadId = thread.id
                 self.connectionState = .connected
-                print("🧵 Thread created: \(thread.id) (model: \(thread.model))")
+                print("🧵 Thread: \(thread.id) (model: \(thread.model))")
             } catch {
-                print("❌ Failed to create thread: \(error)")
                 self.connectionState = .error(error.localizedDescription)
             }
         }
@@ -169,19 +186,22 @@ final class AuraCoordinator: ObservableObject {
     // MARK: - Text Chat
     
     func sendMessage(_ text: String) async {
-        guard let threadId = currentThreadId else {
-            print("⚠️ No active thread")
-            return
-        }
+        guard let threadId = currentThreadId else { return }
         
-        // Add user message to history
         conversationHistory.append(ChatMessage(role: .user, content: text))
         orbState = .processing
         
         do {
+            // Attach current screen context
+            let screenshot = screenStreamer.captureNow()
+            var input: [[String: Any]] = [["type": "text", "text": text]]
+            
+            if let path = screenshot?.path {
+                input.append(["type": "localImage", "path": path])
+            }
+            
             try await codex.startTurn(threadId: threadId, message: text)
         } catch {
-            print("❌ Failed to send message: \(error)")
             orbState = .idle
             conversationHistory.append(ChatMessage(role: .error, content: error.localizedDescription))
         }
@@ -196,20 +216,18 @@ final class AuraCoordinator: ObservableObject {
         
         Task {
             do {
-                // Start realtime voice session through Codex
                 try await codex.startRealtime(threadId: threadId)
                 
-                // Begin audio capture
+                audioPlayer.start()
+                
                 audioCapture.start { [weak self] pcmData in
                     guard let self, let threadId = self.currentThreadId else { return }
                     let base64 = pcmData.base64EncodedString()
-                    Task {
-                        try? await self.codex.appendAudio(threadId: threadId, base64Audio: base64)
-                    }
+                    Task { try? await self.codex.appendAudio(threadId: threadId, base64Audio: base64) }
                 }
             } catch {
-                print("❌ Failed to start voice: \(error)")
                 self.orbState = .idle
+                print("❌ Voice failed: \(error)")
             }
         }
     }
@@ -221,35 +239,56 @@ final class AuraCoordinator: ObservableObject {
         orbState = .processing
         
         Task {
-            do {
-                try await codex.stopRealtime(threadId: threadId)
-            } catch {
-                print("❌ Failed to stop voice: \(error)")
-            }
+            try? await codex.stopRealtime(threadId: threadId)
+            audioPlayer.stop()
             self.orbState = .idle
         }
     }
     
-    // MARK: - Events
+    // MARK: - Screen Streaming
     
-    private func handleTurnEvent(_ event: TurnEvent) {
-        switch event {
-        case .started(let threadId):
-            print("🔄 Turn started on \(threadId)")
-            
-        case .completed(let threadId):
-            print("✅ Turn completed on \(threadId)")
-            orbState = .idle
-            
-        case .agentMessage(let text):
-            conversationHistory.append(ChatMessage(role: .assistant, content: text))
-            
-        case .toolCall(let name, let args):
-            print("🔧 Tool call: \(name) \(args)")
-            
-        case .error(let message):
-            orbState = .idle
-            conversationHistory.append(ChatMessage(role: .error, content: message))
+    private func startScreenStreaming() {
+        guard !isScreenStreaming else { return }
+        isScreenStreaming = true
+        screenStreamer.start(fps: 1.0)
+    }
+    
+    private func handleScreenFrame(_ url: URL) {
+        // Feed screen frames to the active thread periodically
+        // This gives Aura continuous awareness of what's on screen
+        // Frames are lightweight — Codex handles vision natively
+        
+        // For proactive scanning, feed to nudge engine
+        if proactivityLevel != .silent {
+            // Every ~10 frames (10 seconds at 1fps), run a scan
+            nudgeEngine.analyzeScreen(context: "Screen frame at \(url.lastPathComponent)")
+        }
+    }
+    
+    // MARK: - Proactivity
+    
+    func setProactivity(_ level: NudgeEngine.ProactivityLevel) {
+        proactivityLevel = level
+        nudgeEngine.setLevel(level)
+    }
+    
+    func dismissNudge() {
+        activeNudge = nil
+    }
+    
+    // MARK: - Approvals
+    
+    func approveRequest(id: String) {
+        guard let pending = pendingApprovals.removeValue(forKey: id) else { return }
+        Task {
+            try? await codex.resolveRequest(requestId: pending["id"] as Any, result: ["approved": true])
+        }
+    }
+    
+    func denyRequest(id: String) {
+        guard let pending = pendingApprovals.removeValue(forKey: id) else { return }
+        Task {
+            try? await codex.resolveRequest(requestId: pending["id"] as Any, result: ["approved": false])
         }
     }
     
@@ -259,11 +298,8 @@ final class AuraCoordinator: ObservableObject {
         Task {
             do {
                 let result = try await codex.loginAccount()
-                if let url = result.loginUrl {
-                    // Open the OAuth URL in the browser
-                    if let url = URL(string: url) {
-                        NSWorkspace.shared.open(url)
-                    }
+                if let url = result.loginUrl, let url = URL(string: url) {
+                    NSWorkspace.shared.open(url)
                 }
             } catch {
                 print("❌ Login failed: \(error)")
@@ -271,11 +307,42 @@ final class AuraCoordinator: ObservableObject {
         }
     }
     
+    // MARK: - Events
+    
+    private func handleTurnEvent(_ event: TurnEvent) {
+        switch event {
+        case .started:
+            orbState = .processing
+            
+        case .completed:
+            orbState = .idle
+            
+        case .agentMessage(let text):
+            conversationHistory.append(ChatMessage(role: .assistant, content: text))
+            orbState = .speaking
+            DispatchQueue.main.asyncAfter(deadline: .now() + 1) { [weak self] in
+                if self?.orbState == .speaking { self?.orbState = .idle }
+            }
+            
+        case .toolCall(let name, let args):
+            let detail = "\(name) \(args.map { "\($0.key)=\($0.value)" }.joined(separator: " "))"
+            conversationHistory.append(ChatMessage(role: .system, content: "🔧 \(detail)"))
+            
+        case .error(let message):
+            orbState = .idle
+            conversationHistory.append(ChatMessage(role: .error, content: message))
+        }
+    }
+    
     // MARK: - Cleanup
     
     func shutdown() {
-        codex.disconnect()
+        screenStreamer.stop()
+        screenStreamer.cleanup()
+        nudgeEngine.stopScanning()
         audioCapture.stop()
+        audioPlayer.stop()
+        codex.disconnect()
         codexProcess?.terminate()
     }
 }

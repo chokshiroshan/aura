@@ -74,6 +74,15 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
     }
     
     @objc private func openSettings() {
-        // TODO: Settings window
+        let settingsWindow = NSWindow(
+            contentRect: NSRect(x: 0, y: 0, width: 450, height: 320),
+            styleMask: [.titled, .closable],
+            backing: .buffered,
+            defer: false
+        )
+        settingsWindow.title = "Aura Settings"
+        settingsWindow.contentView = NSHostingView(rootView: SettingsView(coordinator: coordinator))
+        settingsWindow.center()
+        settingsWindow.makeKeyAndOrderFront(nil)
     }
 }
