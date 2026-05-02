@@ -13,18 +13,67 @@ struct AuraApp: App {
 
 // MARK: - App Delegate
 
-final class AppDelegate: NSObject, NSApplicationHandler {
+final class AppDelegate: NSObject, NSApplicationDelegate {
     let coordinator = AuraCoordinator()
 
     func applicationDidFinishLaunching(_ notification: Notification) {
-        // Spawn the floating companion on every screen
-        CompanionWindowManager.shared.spawnCompanion(on: NSScreen.screens)
+        // Hide from dock — Aura lives as a floating companion + menu bar
+        NSApp.setActivationPolicy(.accessory)
+        
+        // Spawn the floating orb companion on every screen
+        CompanionWindowManager.shared.spawnCompanion(
+            on: NSScreen.screens,
+            coordinator: coordinator
+        )
+        
+        // Menu bar item
+        setupStatusBar()
         
         // Launch Codex binary and connect
         coordinator.startCodexAndConnect()
+        
+        print("🛰️ Aura launched")
     }
     
     func applicationWillTerminate(_ notification: Notification) {
         coordinator.shutdown()
+    }
+    
+    // MARK: - Status Bar
+    
+    private func setupStatusBar() {
+        let item = NSStatusBar.system.statusItem(withLength: NSStatusItem.squareLength)
+        
+        if let button = item.button {
+            button.image = NSImage(systemSymbolName: "circle.circle", accessibilityDescription: "Aura")
+            button.image?.size = NSSize(width: 18, height: 18)
+        }
+        
+        let menu = NSMenu()
+        menu.addItem(withTitle: "Toggle Conversation", action: #selector(toggleConversation), keyEquivalent: "")
+        menu.addItem(withTitle: "Voice Mode", action: #selector(toggleVoice), keyEquivalent: "v")
+        menu.addItem(.separator())
+        menu.addItem(withTitle: "Settings...", action: #selector(openSettings), keyEquivalent: ",")
+        menu.addItem(.separator())
+        menu.addItem(withTitle: "Quit Aura", action: #selector(NSApplication.terminate(_:)), keyEquivalent: "q")
+        
+        item.menu = menu
+    }
+    
+    @objc private func toggleConversation() {
+        // TODO: Toggle conversation panel programmatically
+    }
+    
+    @objc private func toggleVoice() {
+        switch coordinator.orbState {
+        case .listening:
+            coordinator.stopVoiceConversation()
+        default:
+            coordinator.startVoiceConversation()
+        }
+    }
+    
+    @objc private func openSettings() {
+        // TODO: Settings window
     }
 }

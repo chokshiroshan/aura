@@ -1,14 +1,32 @@
 import SwiftUI
 
 /// Glowing orb companion — the visual face of Aura.
-/// Pulses, changes color with state, reacts to interaction.
+///
+/// Siri-like / futuristic aesthetic. Not a button, a presence.
+/// Reacts to coordinator state:
+/// - **Idle**: Subtle breathing, soft purple glow
+/// - **Listening**: Cyan pulse, expanding rings
+/// - **Processing**: Amber spin, loading feel
+/// - **Speaking**: Green glow, calm rhythm
+/// - **Sleeping**: Deep purple, slow breath
 struct AuraCompanionView: View {
+    @ObservedObject var coordinator: AuraCoordinator
+    
     @State private var breathScale: CGFloat = 1.0
     @State private var glowRadius: CGFloat = 30
     @State private var ringRotation: Double = 0
-    @State private var orbColor: Color = .orbIdle
     @State private var innerPulse: CGFloat = 0
-
+    
+    private var orbColor: Color {
+        switch coordinator.orbState {
+        case .idle:       return .orbIdle
+        case .listening:  return .orbListening
+        case .processing: return .orbProcessing
+        case .speaking:   return .orbSpeaking
+        case .sleeping:   return .orbSleeping
+        }
+    }
+    
     var body: some View {
         ZStack {
             // Outer glow
@@ -28,8 +46,8 @@ struct AuraCompanionView: View {
                 .frame(width: 120, height: 120)
                 .scaleEffect(breathScale)
                 .blur(radius: glowRadius * 0.3)
-
-            // Rotating ring (subtle orbital)
+            
+            // Rotating ring
             Circle()
                 .stroke(
                     AngularGradient(
@@ -45,7 +63,7 @@ struct AuraCompanionView: View {
                 )
                 .frame(width: 76, height: 76)
                 .rotationEffect(.degrees(ringRotation))
-
+            
             // Main orb body
             Circle()
                 .fill(
@@ -77,10 +95,10 @@ struct AuraCompanionView: View {
                         .frame(width: 40, height: 40)
                         .opacity(0.6 + Double(innerPulse) * 0.3)
                 )
-
-            // Listening indicator (concentric rings)
-            if true { // TODO: bind to orbState == .listening
-                ForEach(0..<3) { i in
+            
+            // Listening indicator — concentric rings
+            if coordinator.orbState == .listening {
+                ForEach(0..<3, id: \.self) { i in
                     Circle()
                         .stroke(orbColor.opacity(0.3), lineWidth: 1)
                         .frame(width: CGFloat(70 + i * 15), height: CGFloat(70 + i * 15))
@@ -88,72 +106,42 @@ struct AuraCompanionView: View {
                         .opacity(Double(3 - i) / 3.0 * Double(innerPulse))
                 }
             }
+            
+            // Processing spinner — faster ring rotation
+            if coordinator.orbState == .processing {
+                Circle()
+                    .trim(from: 0, to: 0.7)
+                    .stroke(orbColor.opacity(0.6), lineWidth: 2)
+                    .frame(width: 80, height: 80)
+                    .rotationEffect(.degrees(ringRotation * 3))
+            }
         }
         .frame(width: 120, height: 120)
-        .onAppear {
-            startAnimations()
-        }
-        .onTapGesture {
-            // TODO: trigger interaction
-            pulseOnce()
-        }
+        .animation(.easeInOut(duration: 0.5), value: coordinator.orbState)
+        .onAppear { startAnimations() }
     }
-
+    
     // MARK: - Animations
-
+    
     private func startAnimations() {
         // Breathing
-        withAnimation(
-            .easeInOut(duration: 3.0)
-            .repeatForever(autoreverses: true)
-        ) {
+        withAnimation(.easeInOut(duration: 3.0).repeatForever(autoreverses: true)) {
             breathScale = 1.08
         }
-
+        
         // Orbital ring rotation
-        withAnimation(
-            .linear(duration: 20)
-            .repeatForever(autoreverses: false)
-        ) {
+        withAnimation(.linear(duration: 20).repeatForever(autoreverses: false)) {
             ringRotation = 360
         }
-
+        
         // Inner pulse
-        withAnimation(
-            .easeInOut(duration: 1.5)
-            .repeatForever(autoreverses: true)
-        ) {
+        withAnimation(.easeInOut(duration: 1.5).repeatForever(autoreverses: true)) {
             innerPulse = 1.0
-        }
-    }
-
-    private func pulseOnce() {
-        withAnimation(.spring(response: 0.3, dampingFraction: 0.4)) {
-            breathScale = 1.2
-        }
-        DispatchQueue.main.asyncAfter(deadline: .now() + 0.3) {
-            withAnimation(.spring(response: 0.5, dampingFraction: 0.6)) {
-                breathScale = 1.08
-            }
-        }
-    }
-
-    // MARK: - State Colors
-
-    private func updateColor(for state: AuraState) {
-        withAnimation(.easeInOut(duration: 0.5)) {
-            switch state {
-            case .idle:       orbColor = .orbIdle
-            case .listening:  orbColor = .orbListening
-            case .processing: orbColor = .orbProcessing
-            case .speaking:   orbColor = .orbSpeaking
-            case .sleeping:   orbColor = .orbSleeping
-            }
         }
     }
 }
 
-// MARK: - Companion Orb Colors
+// MARK: - Orb Colors
 
 extension Color {
     static let orbIdle       = Color(hex: "6C63FF") // Purple
@@ -161,27 +149,35 @@ extension Color {
     static let orbProcessing = Color(hex: "FFB800") // Amber
     static let orbSpeaking   = Color(hex: "00FF88") // Green
     static let orbSleeping   = Color(hex: "4A42D1") // Deep purple
-
-    func darker() -> Color {
-        // Simple darkening for gradients
-        Color(hex: self.hexValue().darker())
+    
+    init(hex: String) {
+        let hex = hex.trimmingCharacters(in: CharacterSet.alphanumerics.inverted)
+        var int: UInt64 = 0
+        Scanner(string: hex).scanHexInt64(&int)
+        let a, r, g, b: UInt64
+        switch hex.count {
+        case 6: (a, r, g, b) = (255, int >> 16, int >> 8 & 0xFF, int & 0xFF)
+        case 8: (a, r, g, b) = (int >> 24, int >> 16 & 0xFF, int >> 8 & 0xFF, int & 0xFF)
+        default: (a, r, g, b) = (255, 0, 0, 0)
+        }
+        self.init(
+            .sRGB,
+            red: Double(r) / 255,
+            green: Double(g) / 255,
+            blue: Double(b) / 255,
+            opacity: Double(a) / 255
+        )
     }
-
-    private func hexValue() -> String {
-        // Extract hex from UIColor
-        let uiColor = UIColor(self)
-        var r: CGFloat = 0; var g: CGFloat = 0; var b: CGFloat = 0
-        uiColor.getRed(&r, green: &g, blue: &b, alpha: nil)
-        return String(format: "%02X%02X%02X", Int(r * 255), Int(g * 255), Int(b * 255))
+    
+    func darker() -> Color {
+        Color(UIColor(self).darker())
     }
 }
 
-private extension String {
-    func darker() -> String {
-        guard let val = UInt64(self, radix: 16) else { return self }
-        let r = max(Int((val >> 16) & 0xFF) - 40, 0)
-        let g = max(Int((val >> 8) & 0xFF) - 40, 0)
-        let b = max(Int(val & 0xFF) - 40, 0)
-        return String(format: "%02X%02X%02X", r, g, b)
+extension UIColor {
+    func darker() -> UIColor {
+        var r: CGFloat = 0; var g: CGFloat = 0; var b: CGFloat = 0; var a: CGFloat = 0
+        getRed(&r, green: &g, blue: &b, alpha: &a)
+        return UIColor(red: max(r - 0.15, 0), green: max(g - 0.15, 0), blue: max(b - 0.15, 0), alpha: a)
     }
 }

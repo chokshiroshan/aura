@@ -282,7 +282,7 @@ final class AuraCoordinator: ObservableObject {
 
 // MARK: - Types
 
-enum AuraState {
+enum AuraState: Equatable {
     case idle
     case listening
     case processing
