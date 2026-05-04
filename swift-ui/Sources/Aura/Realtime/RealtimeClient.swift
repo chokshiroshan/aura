@@ -34,7 +34,17 @@ final class RealtimeClient {
     }
 
     func connect(accessToken: String, model: String = FlowConfig.load().realtimeModel, mode: ConnectionMode, backendMode: Bool = false) async throws {
-        let urlString = "wss://api.openai.com/v1/realtime?model=\(model)"
+        // backendMode = ChatGPT subscription (free, via Codex OAuth)
+        // !backendMode = paid API endpoint (api.openai.com, costs tokens)
+        let urlString: String
+        if backendMode {
+            // Free path: ChatGPT backend via subscription token
+            // Same endpoint Codex CLI uses — unlimited tokens, $0 cost
+            urlString = "wss://chatgpt.com/backend-api/codex/realtime"
+        } else {
+            // Paid path: direct OpenAI API (requires API key, costs per token)
+            urlString = "wss://api.openai.com/v1/realtime?model=\(model)"
+        }
 
         guard let url = URL(string: urlString) else {
             throw RealtimeError.invalidURL
@@ -42,7 +52,9 @@ final class RealtimeClient {
 
         var request = URLRequest(url: url)
         request.setValue("Bearer \(accessToken)", forHTTPHeaderField: "Authorization")
-        request.setValue("realtime=v1", forHTTPHeaderField: "OpenAI-Beta")
+        if !backendMode {
+            request.setValue("realtime=v1", forHTTPHeaderField: "OpenAI-Beta")
+        }
 
         print("🔌 Connecting to Realtime API: \(urlString) (backend: \(backendMode))")
 
