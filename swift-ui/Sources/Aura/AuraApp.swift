@@ -13,6 +13,7 @@ struct AuraApp: App {
 
 // MARK: - App Delegate
 
+@MainActor
 final class AppDelegate: NSObject, NSApplicationDelegate {
     let coordinator = AuraCoordinator()
 
@@ -61,7 +62,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
     }
     
     @objc private func toggleConversation() {
-        // TODO: Toggle conversation panel programmatically
+        CompanionWindowManager.shared.toggleConversation()
     }
     
     @objc private func toggleVoice() {

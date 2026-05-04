@@ -54,27 +54,129 @@ final class ScreenStreamer {
     
     /// Capture a single frame on-demand
     func captureNow() -> URL? {
-        guard let image = captureScreen() else { return nil }
-        return saveFrame(image)
+        guard let image = captureScreen() else {
+            print("⚠️ Screen capture failed")
+            return nil
+        }
+        guard let url = saveFrame(image) else {
+            print("⚠️ Screen capture failed: could not save frame")
+            return nil
+        }
+        print("📸 Captured screen frame: \(url.path)")
+        return url
     }
     
     // MARK: - Private
     
     private func captureAndEmit() {
-        guard let image = captureScreen() else { return }
-        guard let url = saveFrame(image) else { return }
+        guard let image = captureScreen() else {
+            print("⚠️ Screen stream skipped frame: capture failed")
+            return
+        }
+        guard let url = saveFrame(image) else {
+            print("⚠️ Screen stream skipped frame: save failed")
+            return
+        }
         frameCount += 1
         onFrame?(url)
     }
     
     private func captureScreen() -> CGImage? {
-        guard let screen = NSScreen.screenWithMouse ?? NSScreen.main else { return nil }
-        
-        guard let displayID = screen.deviceDescription[NSDeviceDescriptionKey("NSScreenNumber")] as? UInt32 else {
+        if !PermissionsManager.shared.checkScreenRecording() {
+            print("⚠️ Screen Recording permission is not granted")
+            _ = PermissionsManager.shared.requestScreenRecording()
             return nil
         }
-        
-        return CGDisplayCreateImage(displayID, rect: screen.frame)
+
+        if let image = captureVisibleDesktop() {
+            return image
+        }
+
+        return captureAllActiveDisplays()
+    }
+
+    private func captureVisibleDesktop() -> CGImage? {
+        let options: CGWindowImageOption = [.bestResolution, .nominalResolution]
+        let image = CGWindowListCreateImage(
+            .null,
+            .optionOnScreenOnly,
+            kCGNullWindowID,
+            options
+        )
+
+        if image == nil {
+            print("⚠️ Window-list screen capture returned nil; falling back to displays")
+        }
+        return image
+    }
+
+    private func captureAllActiveDisplays() -> CGImage? {
+        var displayCount: UInt32 = 0
+        var error = CGGetActiveDisplayList(0, nil, &displayCount)
+        guard error == .success, displayCount > 0 else {
+            print("⚠️ Screen capture failed: no active displays (\(error.rawValue))")
+            return nil
+        }
+
+        var displayIDs = [CGDirectDisplayID](repeating: 0, count: Int(displayCount))
+        error = CGGetActiveDisplayList(displayCount, &displayIDs, &displayCount)
+        guard error == .success else {
+            print("⚠️ Screen capture failed: display list error \(error.rawValue)")
+            return nil
+        }
+
+        let captures = displayIDs.compactMap { displayID -> (CGDirectDisplayID, CGRect, CGImage)? in
+            guard let image = CGDisplayCreateImage(displayID) else {
+                print("⚠️ Screen capture skipped display \(displayID): CGDisplayCreateImage returned nil")
+                return nil
+            }
+            return (displayID, CGDisplayBounds(displayID), image)
+        }
+
+        guard !captures.isEmpty else {
+            print("⚠️ Screen capture failed: no displays produced an image")
+            return nil
+        }
+
+        let union = captures.reduce(CGRect.null) { partial, capture in
+            partial.union(capture.1)
+        }
+        let width = Int(union.width.rounded(.up))
+        let height = Int(union.height.rounded(.up))
+
+        guard width > 0, height > 0 else {
+            print("⚠️ Screen capture failed: invalid composite bounds \(union)")
+            return nil
+        }
+
+        guard let ctx = CGContext(
+            data: nil,
+            width: width,
+            height: height,
+            bitsPerComponent: 8,
+            bytesPerRow: 0,
+            space: CGColorSpaceCreateDeviceRGB(),
+            bitmapInfo: CGImageAlphaInfo.premultipliedLast.rawValue
+        ) else {
+            print("⚠️ Screen capture failed: could not create composite context")
+            return nil
+        }
+
+        for (_, bounds, image) in captures {
+            let rect = CGRect(
+                x: bounds.minX - union.minX,
+                y: bounds.minY - union.minY,
+                width: bounds.width,
+                height: bounds.height
+            )
+            ctx.draw(image, in: rect)
+        }
+
+        guard let image = ctx.makeImage() else {
+            print("⚠️ Screen capture failed: could not render composite image")
+            return nil
+        }
+        return image
     }
     
     private func saveFrame(_ image: CGImage) -> URL? {
@@ -88,12 +190,16 @@ final class ScreenStreamer {
             data as CFMutableData, "public.png" as CFString, 1, nil
         ) else { return nil }
         CGImageDestinationAddImage(dest, resized, nil)
-        guard CGImageDestinationFinalize(dest) else { return nil }
+        guard CGImageDestinationFinalize(dest) else {
+            print("⚠️ Screen capture failed: PNG encoder failed")
+            return nil
+        }
         
         do {
             try (data as Data).write(to: url)
             return url
         } catch {
+            print("⚠️ Screen capture failed: \(error.localizedDescription)")
             return nil
         }
     }

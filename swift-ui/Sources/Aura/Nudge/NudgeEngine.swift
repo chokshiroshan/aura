@@ -40,12 +40,14 @@ final class NudgeEngine {
     }
     
     // MARK: - State
-    private(set) var level: ProactivityLevel = .active
+    private(set) var level: ProactivityLevel = .silent
     private var lastNudgeTime: Date = .distantPast
     private let minInterval: TimeInterval = 30  // Don't nudge more than every 30s
     private var scanTimer: Timer?
     private var codex: CodexClient?
     private var scanThreadId: String?
+    private var lastScanTime: Date = .distantPast
+    private var isScanInFlight = false
     
     // MARK: - Config
     
@@ -60,11 +62,16 @@ final class NudgeEngine {
     func setCodexClient(_ client: CodexClient) {
         self.codex = client
     }
+
+    func isScanThread(_ threadId: String) -> Bool {
+        scanThreadId == threadId
+    }
     
     // MARK: - Scanning
     
     func startScanning() {
         guard level != .silent else { return }
+        scanTimer?.invalidate()
         
         let interval: TimeInterval
         switch level {
@@ -96,12 +103,19 @@ final class NudgeEngine {
     }
     
     /// Analyze a screen frame and decide if a nudge is warranted
-    func analyzeScreen(context: String) {
+    func analyzeScreen(context: String, imagePath: String? = nil) {
         guard level != .silent else { return }
         guard Date().timeIntervalSince(lastNudgeTime) >= minInterval else { return }
+        guard Date().timeIntervalSince(lastScanTime) >= scanInterval else { return }
+        guard !isScanInFlight else { return }
         guard let codex else { return }
+
+        lastScanTime = Date()
+        isScanInFlight = true
         
         Task {
+            defer { self.isScanInFlight = false }
+
             do {
                 // Create scan thread if needed
                 if scanThreadId == nil {
@@ -127,7 +141,7 @@ final class NudgeEngine {
                 
                 guard let threadId = scanThreadId else { return }
                 
-                try await codex.startTurn(threadId: threadId, message: context)
+                try await codex.startTurn(threadId: threadId, message: context, localImagePath: imagePath)
                 
                 // The response comes via onTurnEvent — coordinator routes it back
             } catch {
@@ -135,10 +149,20 @@ final class NudgeEngine {
             }
         }
     }
+
+    private var scanInterval: TimeInterval {
+        switch level {
+        case .silent: return .infinity
+        case .light: return 120
+        case .active: return 60
+        case .partner: return 30
+        }
+    }
     
     /// Process scan result from Codex
     func handleScanResult(_ text: String) {
-        guard text != "NONE" else { return }
+        let text = text.trimmingCharacters(in: .whitespacesAndNewlines)
+        guard !text.isEmpty, text != "NONE" else { return }
         
         let parts = text.split(separator: "|")
         let nudgeText = parts.first.map { String($0.replacingOccurrences(of: "NUDGE: ", with: "")) } ?? text

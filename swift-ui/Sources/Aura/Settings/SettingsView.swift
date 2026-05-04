@@ -23,6 +23,7 @@ struct SettingsView: View {
 
 private struct GeneralSettingsView: View {
     @ObservedObject var coordinator: AuraCoordinator
+    @State private var permissions = PermissionsManager.shared.checkAll()
     
     var body: some View {
         Form {
@@ -63,6 +64,23 @@ private struct GeneralSettingsView: View {
             }
             
             Section("Screen") {
+                LabeledContent("Permission") {
+                    HStack(spacing: 8) {
+                        Label(
+                            permissions.screenRecording ? "Granted" : "Needed",
+                            systemImage: permissions.screenRecording ? "checkmark.circle.fill" : "exclamationmark.triangle.fill"
+                        )
+                        .foregroundColor(permissions.screenRecording ? .green : .orange)
+
+                        if !permissions.screenRecording {
+                            Button("Allow") {
+                                _ = PermissionsManager.shared.requestScreenRecording()
+                                PermissionsManager.shared.openScreenRecordingSettings()
+                            }
+                        }
+                    }
+                }
+
                 LabeledContent("Vision") {
                     Toggle("Stream screen to Aura", isOn: .constant(true))
                 }
@@ -70,6 +88,9 @@ private struct GeneralSettingsView: View {
         }
         .formStyle(.grouped)
         .padding()
+        .onAppear {
+            permissions = PermissionsManager.shared.checkAll()
+        }
     }
 }
 

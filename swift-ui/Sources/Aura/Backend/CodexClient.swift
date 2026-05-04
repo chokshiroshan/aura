@@ -16,12 +16,20 @@ final class CodexClient {
     var onTurnEvent: ((TurnEvent) -> Void)?
     var onModelError: ((String) -> Void)?
     var onAuthRequired: (() -> Void)?
+    var onAccountUpdated: (() -> Void)?
+    var onLoginCompleted: ((Bool, String?) -> Void)?
+    var onRealtimeStarted: ((String) -> Void)?
+    var onRealtimeTranscript: ((String, String, String, Bool) -> Void)?
+    var onRealtimeAudio: ((String, Data) -> Void)?
+    var onRealtimeError: ((String, String) -> Void)?
+    var onRealtimeClosed: ((String, String?) -> Void)?
     
     // MARK: - State
     private var webSocket: URLSessionWebSocketTask?
     private(set) var isConnected = false
     private var requestId: Int64 = 0
     private var pendingRequests: [Int64: CheckedContinuation<JSONValue, Error>] = [:]
+    private var streamedAgentMessageItemIds = Set<String>()
     private let decoder = JSONDecoder()
     private let encoder = JSONEncoder()
     
@@ -72,6 +80,7 @@ final class CodexClient {
                 ]
             ]
         )
+        try await sendNotification(method: "initialized")
         return InitializeResult(from: response)
     }
     
@@ -79,7 +88,7 @@ final class CodexClient {
     
     /// Get current auth status
     func getAccount() async throws -> AccountInfo {
-        let response = try await sendRequest(method: "account/read", params: [:])
+        let response = try await sendRequest(method: "account/read", params: ["refreshToken": false])
         return AccountInfo(from: response)
     }
     
@@ -87,7 +96,7 @@ final class CodexClient {
     func loginAccount() async throws -> LoginResult {
         let response = try await sendRequest(
             method: "account/login/start",
-            params: ["authMode": "chatgpt"]
+            params: ["type": "chatgpt", "codexStreamlinedLogin": true]
         )
         return LoginResult(from: response)
     }
@@ -95,10 +104,11 @@ final class CodexClient {
     // MARK: - Thread Management
     
     /// Create a new conversation thread
-    func startThread(cwd: String? = nil, instructions: String? = nil) async throws -> ThreadInfo {
+    func startThread(cwd: String? = nil, instructions: String? = nil, config: [String: Any]? = nil) async throws -> ThreadInfo {
         var params: [String: Any] = [:]
         if let cwd { params["cwd"] = cwd }
         if let instructions { params["baseInstructions"] = instructions }
+        if let config { params["config"] = config }
         
         let response = try await sendRequest(method: "thread/start", params: params)
         return ThreadInfo(from: response)
@@ -122,14 +132,20 @@ final class CodexClient {
     // MARK: - Turns (conversation)
     
     /// Start a turn — send a text message and get a response
-    func startTurn(threadId: String, message: String) async throws {
+    func startTurn(threadId: String, message: String, localImagePath: String? = nil) async throws {
+        var input: [[String: Any]] = [
+            ["type": "text", "text": message, "text_elements": []]
+        ]
+        if let localImagePath {
+            input.append(["type": "localImage", "path": localImagePath])
+        }
+
         let _ = try await sendRequest(
             method: "turn/start",
             params: [
                 "threadId": threadId,
-                "input": [
-                    ["type": "text", "text": message]
-                ]
+                "input": input,
+                "effort": "low"
             ]
         )
     }
@@ -161,7 +177,8 @@ final class CodexClient {
     func startRealtime(threadId: String, voice: String? = nil) async throws {
         var params: [String: Any] = [
             "threadId": threadId,
-            "outputModality": "audio"
+            "outputModality": "audio",
+            "transport": ["type": "websocket"]
         ]
         if let voice { params["voice"] = voice }
         
@@ -172,12 +189,44 @@ final class CodexClient {
     }
     
     /// Send audio to the realtime session
-    func appendAudio(threadId: String, base64Audio: String) async throws {
+    func appendAudio(threadId: String, pcmData: Data, sampleRate: Int = 24_000, numChannels: Int = 1) async throws {
+        let channelCount = max(numChannels, 1)
+        let samplesPerChannel = pcmData.count / (2 * channelCount)
         let _ = try await sendRequest(
             method: "thread/realtime/appendAudio",
             params: [
                 "threadId": threadId,
-                "audio": base64Audio
+                "audio": [
+                    "data": pcmData.base64EncodedString(),
+                    "sampleRate": sampleRate,
+                    "numChannels": channelCount,
+                    "samplesPerChannel": samplesPerChannel
+                ]
+            ]
+        )
+    }
+
+    /// Send text to the realtime session.
+    func appendText(threadId: String, text: String) async throws {
+        let _ = try await sendRequest(
+            method: "thread/realtime/appendText",
+            params: [
+                "threadId": threadId,
+                "text": text
+            ]
+        )
+    }
+
+    /// Send an image into the realtime session.
+    func appendImage(threadId: String, imagePath: String, detail: String = "auto") async throws {
+        let data = try Data(contentsOf: URL(fileURLWithPath: imagePath))
+        let imageURL = "data:image/png;base64,\(data.base64EncodedString())"
+        let _ = try await sendRequest(
+            method: "thread/realtime/appendImage",
+            params: [
+                "threadId": threadId,
+                "imageUrl": imageURL,
+                "detail": detail
             ]
         )
     }
@@ -258,6 +307,28 @@ final class CodexClient {
             }
         }
     }
+
+    private func sendNotification(method: String, params: [String: Any]? = nil) async throws {
+        var message: [String: Any] = ["method": method]
+        if let params {
+            message["params"] = params
+        }
+
+        let data = try JSONSerialization.data(withJSONObject: message)
+        guard let jsonStr = String(data: data, encoding: .utf8) else {
+            throw CodexError.serializationFailed
+        }
+
+        try await withCheckedThrowingContinuation { (continuation: CheckedContinuation<Void, Error>) in
+            webSocket?.send(.string(jsonStr)) { error in
+                if let error {
+                    continuation.resume(throwing: error)
+                } else {
+                    continuation.resume()
+                }
+            }
+        }
+    }
     
     // MARK: - Receiving
     
@@ -332,10 +403,80 @@ final class CodexClient {
             
         case "turn/completed":
             onTurnEvent?(.completed(threadId: params["threadId"] as? String ?? ""))
+
+        case "item/agentMessage/delta":
+            if let delta = params["delta"] as? String {
+                let threadId = params["threadId"] as? String ?? ""
+                if let itemId = params["itemId"] as? String {
+                    streamedAgentMessageItemIds.insert(itemId)
+                }
+                onTurnEvent?(.agentMessage(threadId: threadId, text: delta))
+            }
+
+        case "item/completed":
+            guard let item = params["item"] as? [String: Any],
+                  item["type"] as? String == "agentMessage",
+                  let text = item["text"] as? String,
+                  !text.isEmpty else {
+                break
+            }
+            if let itemId = item["id"] as? String,
+               streamedAgentMessageItemIds.contains(itemId) {
+                break
+            }
+            let threadId = params["threadId"] as? String ?? ""
+            onTurnEvent?(.agentMessage(threadId: threadId, text: text))
+
+        case "account/login/completed":
+            let success = params["success"] as? Bool ?? false
+            let error = params["error"] as? String
+            onLoginCompleted?(success, error)
+
+        case "account/updated":
+            onAccountUpdated?()
+
+        case "thread/realtime/started":
+            let threadId = params["threadId"] as? String ?? ""
+            onRealtimeStarted?(threadId)
+
+        case "thread/realtime/transcript/delta":
+            let threadId = params["threadId"] as? String ?? ""
+            let role = params["role"] as? String ?? ""
+            let delta = params["delta"] as? String ?? ""
+            onRealtimeTranscript?(threadId, role, delta, false)
+
+        case "thread/realtime/transcript/done":
+            let threadId = params["threadId"] as? String ?? ""
+            let role = params["role"] as? String ?? ""
+            let text = params["text"] as? String ?? ""
+            onRealtimeTranscript?(threadId, role, text, true)
+
+        case "thread/realtime/outputAudio/delta":
+            let threadId = params["threadId"] as? String ?? ""
+            if let audio = params["audio"] as? [String: Any],
+               let data = audio["data"] as? String,
+               let decoded = Data(base64Encoded: data) {
+                onRealtimeAudio?(threadId, decoded)
+            }
+
+        case "thread/realtime/error":
+            let threadId = params["threadId"] as? String ?? ""
+            let message = params["message"] as? String ?? "Realtime voice failed"
+            onRealtimeError?(threadId, message)
+
+        case "thread/realtime/closed":
+            let threadId = params["threadId"] as? String ?? ""
+            let reason = params["reason"] as? String
+            onRealtimeClosed?(threadId, reason)
             
         case "error":
             let msg = (params["error"] as? [String: Any])?["message"] as? String ?? "Unknown error"
-            onModelError?(msg)
+            let threadId = params["threadId"] as? String ?? ""
+            if threadId.isEmpty {
+                onModelError?(msg)
+            } else {
+                onTurnEvent?(.error(threadId: threadId, message: msg))
+            }
             
         case "item/commandExecution/requestApproval":
             // Server wants approval for a shell command
@@ -410,9 +551,16 @@ struct AccountInfo {
             plan = nil
             return
         }
-        self.authMode = dict["authMode"] as? String ?? "unknown"
-        self.email = dict["email"] as? String
-        self.plan = dict["plan"] as? String
+
+        if let account = dict["account"] as? [String: Any] {
+            self.authMode = account["type"] as? String ?? "unknown"
+            self.email = account["email"] as? String
+            self.plan = account["planType"] as? String
+        } else {
+            self.authMode = dict["authMode"] as? String ?? "unknown"
+            self.email = dict["email"] as? String
+            self.plan = dict["plan"] as? String ?? dict["planType"] as? String
+        }
     }
 }
 
@@ -424,7 +572,7 @@ struct LoginResult {
             loginUrl = nil
             return
         }
-        self.loginUrl = dict["url"] as? String
+        self.loginUrl = dict["authUrl"] as? String ?? dict["url"] as? String
     }
 }
 
@@ -470,7 +618,7 @@ struct ThreadSummary {
 enum TurnEvent {
     case started(threadId: String)
     case completed(threadId: String)
-    case agentMessage(text: String)
+    case agentMessage(threadId: String, text: String)
     case toolCall(name: String, args: [String: Any])
-    case error(message: String)
+    case error(threadId: String, message: String)
 }

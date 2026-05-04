@@ -1,4 +1,5 @@
 import SwiftUI
+import AppKit
 
 /// Glowing orb companion — the visual face of Aura.
 ///
@@ -170,14 +171,14 @@ extension Color {
     }
     
     func darker() -> Color {
-        Color(UIColor(self).darker())
+        Color(NSColor(self).darker())
     }
 }
 
-extension UIColor {
-    func darker() -> UIColor {
+extension NSColor {
+    func darker() -> NSColor {
         var r: CGFloat = 0; var g: CGFloat = 0; var b: CGFloat = 0; var a: CGFloat = 0
-        getRed(&r, green: &g, blue: &b, alpha: &a)
-        return UIColor(red: max(r - 0.15, 0), green: max(g - 0.15, 0), blue: max(b - 0.15, 0), alpha: a)
+        (usingColorSpace(.sRGB) ?? self).getRed(&r, green: &g, blue: &b, alpha: &a)
+        return NSColor(red: max(r - 0.15, 0), green: max(g - 0.15, 0), blue: max(b - 0.15, 0), alpha: a)
     }
 }

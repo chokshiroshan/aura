@@ -29,7 +29,7 @@ final class AuraCoordinator: ObservableObject {
     @Published var accountPlan: String?
     @Published var conversationHistory: [ChatMessage] = []
     @Published var activeNudge: NudgeEngine.Nudge?
-    @Published var proactivityLevel: NudgeEngine.ProactivityLevel = .active
+    @Published var proactivityLevel: NudgeEngine.ProactivityLevel = .silent
     
     // MARK: - Components
     private let codex = CodexClient()
@@ -42,7 +42,11 @@ final class AuraCoordinator: ObservableObject {
     
     // MARK: - State
     private var isScreenStreaming = false
+    private var isRealtimeActive = false
     private var pendingApprovals: [String: [String: Any]] = [:]
+    private var scanResponseBuffers: [String: String] = [:]
+    private let attachScreenToTextTurns = true
+    private var realtimeScreenTimer: Timer?
     
     // MARK: - Setup
     
@@ -84,19 +88,7 @@ final class AuraCoordinator: ObservableObject {
                     let initResult = try await self?.codex.initialize()
                     print("✅ Codex initialized: \(initResult?.userAgent ?? "?")")
                     
-                    let account = try await self?.codex.getAccount()
-                    self?.accountEmail = account?.email
-                    self?.accountPlan = account?.plan
-                    
-                    if account?.email == nil {
-                        self?.connectionState = .authenticating
-                        self?.codex.onAuthRequired?()
-                    } else {
-                        self?.connectionState = .connected
-                        self?.createOrResumeThread()
-                        self?.startScreenStreaming()
-                        self?.nudgeEngine.startScanning()
-                    }
+                    await self?.refreshAccountAndStart()
                 } catch {
                     self?.connectionState = .error(error.localizedDescription)
                 }
@@ -126,6 +118,81 @@ final class AuraCoordinator: ObservableObject {
                 self?.orbState = .idle
                 self?.connectionState = .error(msg)
             }
+        }
+
+        codex.onLoginCompleted = { [weak self] success, error in
+            Task { @MainActor in
+                if success {
+                    await self?.refreshAccountAndStart()
+                } else {
+                    self?.connectionState = .error(error ?? "ChatGPT login failed")
+                }
+            }
+        }
+
+        codex.onAccountUpdated = { [weak self] in
+            Task { @MainActor in
+                await self?.refreshAccountAndStart()
+            }
+        }
+
+        codex.onRealtimeStarted = { [weak self] threadId in
+            Task { @MainActor in
+                guard let self, threadId == self.currentThreadId else { return }
+                self.isRealtimeActive = true
+                self.orbState = .listening
+            }
+        }
+
+        codex.onRealtimeTranscript = { [weak self] threadId, role, text, isFinal in
+            Task { @MainActor in
+                guard let self, threadId == self.currentThreadId, isFinal else { return }
+                self.handleRealtimeTranscript(role: role, text: text)
+            }
+        }
+
+        codex.onRealtimeAudio = { [weak self] threadId, data in
+            Task { @MainActor in
+                guard let self, threadId == self.currentThreadId else { return }
+                self.audioPlayer.enqueue(data)
+            }
+        }
+
+        codex.onRealtimeError = { [weak self] threadId, message in
+            Task { @MainActor in
+                guard let self, threadId == self.currentThreadId else { return }
+                self.failVoiceConversation(message)
+            }
+        }
+
+        codex.onRealtimeClosed = { [weak self] threadId, _ in
+            Task { @MainActor in
+                guard let self, threadId == self.currentThreadId else { return }
+                self.endVoiceLocally()
+            }
+        }
+    }
+
+    private func refreshAccountAndStart() async {
+        do {
+            let account = try await codex.getAccount()
+            accountEmail = account.email
+            accountPlan = account.plan
+
+            if account.email == nil && account.authMode != "apiKey" {
+                connectionState = .authenticating
+                codex.onAuthRequired?()
+                return
+            }
+
+            connectionState = .connected
+            createOrResumeThread()
+            if proactivityLevel != .silent {
+                startScreenStreaming()
+                nudgeEngine.startScanning()
+            }
+        } catch {
+            connectionState = .error(error.localizedDescription)
         }
     }
     
@@ -161,6 +228,8 @@ final class AuraCoordinator: ObservableObject {
     // MARK: - Thread Management
     
     private func createOrResumeThread() {
+        guard currentThreadId == nil else { return }
+
         Task {
             do {
                 let thread = try await codex.startThread(
@@ -172,7 +241,8 @@ final class AuraCoordinator: ObservableObject {
                     Be concise, friendly, and proactive. Use tools when helpful.
                     
                     You are not a chatbot. You are a companion that participates in their work.
-                    """
+                    """,
+                    config: realtimeThreadConfig
                 )
                 self.currentThreadId = thread.id
                 self.connectionState = .connected
@@ -181,6 +251,15 @@ final class AuraCoordinator: ObservableObject {
                 self.connectionState = .error(error.localizedDescription)
             }
         }
+    }
+
+    private var realtimeThreadConfig: [String: Any] {
+        [
+            "features.realtime_conversation": true,
+            "realtime.version": "v2",
+            "realtime.type": "conversational",
+            "realtime.transport": "websocket"
+        ]
     }
     
     // MARK: - Text Chat
@@ -192,56 +271,167 @@ final class AuraCoordinator: ObservableObject {
         orbState = .processing
         
         do {
-            // Attach current screen context
-            let screenshot = screenStreamer.captureNow()
-            var input: [[String: Any]] = [["type": "text", "text": text]]
-            
-            if let path = screenshot?.path {
-                input.append(["type": "localImage", "path": path])
+            let shouldIncludeScreen = shouldAttachScreen(to: text)
+            let screenshot = shouldIncludeScreen ? screenStreamer.captureNow() : nil
+            if shouldIncludeScreen && screenshot == nil && !PermissionsManager.shared.checkScreenRecording() {
+                conversationHistory.append(
+                    ChatMessage(
+                        role: .system,
+                        content: "Screen Recording permission is needed. Grant it in System Settings, then relaunch Aura."
+                    )
+                )
             }
-            
-            try await codex.startTurn(threadId: threadId, message: text)
+            if shouldIncludeScreen && screenshot == nil {
+                print("⚠️ Sending text turn without screen context")
+            }
+            try await codex.startTurn(
+                threadId: threadId,
+                message: text,
+                localImagePath: screenshot?.path
+            )
         } catch {
             orbState = .idle
             conversationHistory.append(ChatMessage(role: .error, content: error.localizedDescription))
         }
+    }
+
+    private func shouldAttachScreen(to text: String) -> Bool {
+        if attachScreenToTextTurns {
+            return true
+        }
+
+        let lowercased = text.lowercased()
+        let screenPhrases = [
+            "screen",
+            "screenshot",
+            "see this",
+            "see my",
+            "look at",
+            "what's on",
+            "whats on",
+            "what is on",
+            "on now",
+            "visible",
+            "shown",
+            "window",
+            "desktop",
+            "here"
+        ]
+        return screenPhrases.contains { lowercased.contains($0) }
     }
     
     // MARK: - Voice
     
     func startVoiceConversation() {
         guard let threadId = currentThreadId else { return }
+        guard !isRealtimeActive else { return }
         
         orbState = .listening
         
         Task {
             do {
                 try await codex.startRealtime(threadId: threadId)
-                
+
+                isRealtimeActive = true
+                sendRealtimeScreenSnapshot(threadId: threadId, reason: "voice session started")
+                startRealtimeScreenSnapshots(threadId: threadId)
                 audioPlayer.start()
-                
-                audioCapture.start { [weak self] pcmData in
-                    guard let self, let threadId = self.currentThreadId else { return }
-                    let base64 = pcmData.base64EncodedString()
-                    Task { try? await self.codex.appendAudio(threadId: threadId, base64Audio: base64) }
+
+                audioCapture.onAudioData = { [weak self] pcmData in
+                    Task { @MainActor in
+                        guard let self, let threadId = self.currentThreadId else { return }
+                        try? await self.codex.appendAudio(threadId: threadId, pcmData: pcmData)
+                    }
                 }
+                try audioCapture.start()
             } catch {
-                self.orbState = .idle
-                print("❌ Voice failed: \(error)")
+                self.failVoiceConversation(error.localizedDescription)
             }
         }
     }
     
     func stopVoiceConversation() {
-        guard let threadId = currentThreadId else { return }
-        
-        audioCapture.stop()
+        guard let threadId = currentThreadId else {
+            endVoiceLocally()
+            return
+        }
+
         orbState = .processing
         
         Task {
             try? await codex.stopRealtime(threadId: threadId)
-            audioPlayer.stop()
-            self.orbState = .idle
+            self.endVoiceLocally()
+        }
+    }
+
+    private func handleRealtimeTranscript(role: String, text: String) {
+        let trimmed = text.trimmingCharacters(in: .whitespacesAndNewlines)
+        guard !trimmed.isEmpty else { return }
+
+        switch role {
+        case "assistant":
+            conversationHistory.append(ChatMessage(role: .assistant, content: trimmed))
+            orbState = .speaking
+        case "user":
+            conversationHistory.append(ChatMessage(role: .user, content: trimmed))
+            orbState = .listening
+        default:
+            conversationHistory.append(ChatMessage(role: .system, content: trimmed))
+        }
+    }
+
+    private func failVoiceConversation(_ message: String) {
+        endVoiceLocally()
+        conversationHistory.append(ChatMessage(role: .error, content: "Voice unavailable: \(message)"))
+        print("❌ Voice failed: \(message)")
+    }
+
+    private func endVoiceLocally() {
+        if audioCapture.isRunning {
+            audioCapture.stop()
+        }
+        audioCapture.onAudioData = nil
+        audioPlayer.stop()
+        realtimeScreenTimer?.invalidate()
+        realtimeScreenTimer = nil
+        isRealtimeActive = false
+        orbState = .idle
+    }
+
+    private func startRealtimeScreenSnapshots(threadId: String) {
+        realtimeScreenTimer?.invalidate()
+        realtimeScreenTimer = Timer.scheduledTimer(withTimeInterval: 8.0, repeats: true) { [weak self] _ in
+            Task { @MainActor in
+                self?.sendRealtimeScreenSnapshot(threadId: threadId, reason: "periodic voice screen update")
+            }
+        }
+    }
+
+    private func sendRealtimeScreenSnapshot(threadId: String, reason: String) {
+        guard isRealtimeActive, threadId == currentThreadId else { return }
+        guard let screenshot = screenStreamer.captureNow() else {
+            if !PermissionsManager.shared.checkScreenRecording() {
+                conversationHistory.append(
+                    ChatMessage(
+                        role: .system,
+                        content: "Screen Recording permission is needed for voice screen context. Grant it in System Settings, then relaunch Aura."
+                    )
+                )
+            }
+            print("⚠️ Realtime screen snapshot skipped: capture failed")
+            return
+        }
+
+        Task {
+            do {
+                try await codex.appendImage(threadId: threadId, imagePath: screenshot.path, detail: "low")
+                try await codex.appendText(
+                    threadId: threadId,
+                    text: "Screen context update (\(reason)). Use the attached image as the user's current screen. Do not respond just to acknowledge this update."
+                )
+            } catch {
+                print("⚠️ Realtime screen snapshot failed: \(error.localizedDescription)")
+            }
         }
     }
     
@@ -252,6 +442,12 @@ final class AuraCoordinator: ObservableObject {
         isScreenStreaming = true
         screenStreamer.start(fps: 1.0)
     }
+
+    private func stopScreenStreaming() {
+        guard isScreenStreaming else { return }
+        isScreenStreaming = false
+        screenStreamer.stop()
+    }
     
     private func handleScreenFrame(_ url: URL) {
         // Feed screen frames to the active thread periodically
@@ -261,7 +457,10 @@ final class AuraCoordinator: ObservableObject {
         // For proactive scanning, feed to nudge engine
         if proactivityLevel != .silent {
             // Every ~10 frames (10 seconds at 1fps), run a scan
-            nudgeEngine.analyzeScreen(context: "Screen frame at \(url.lastPathComponent)")
+            nudgeEngine.analyzeScreen(
+                context: "Analyze this screen frame for a useful proactive nudge.",
+                imagePath: url.path
+            )
         }
     }
     
@@ -270,6 +469,13 @@ final class AuraCoordinator: ObservableObject {
     func setProactivity(_ level: NudgeEngine.ProactivityLevel) {
         proactivityLevel = level
         nudgeEngine.setLevel(level)
+        if level == .silent {
+            stopScreenStreaming()
+            nudgeEngine.stopScanning()
+        } else {
+            startScreenStreaming()
+            nudgeEngine.startScanning()
+        }
     }
     
     func dismissNudge() {
@@ -311,14 +517,31 @@ final class AuraCoordinator: ObservableObject {
     
     private func handleTurnEvent(_ event: TurnEvent) {
         switch event {
-        case .started:
+        case .started(let threadId):
+            guard threadId == currentThreadId else { return }
             orbState = .processing
             
-        case .completed:
+        case .completed(let threadId):
+            if nudgeEngine.isScanThread(threadId) {
+                let text = scanResponseBuffers.removeValue(forKey: threadId) ?? ""
+                nudgeEngine.handleScanResult(text)
+                return
+            }
+            guard threadId == currentThreadId else { return }
             orbState = .idle
             
-        case .agentMessage(let text):
-            conversationHistory.append(ChatMessage(role: .assistant, content: text))
+        case .agentMessage(let threadId, let text):
+            if nudgeEngine.isScanThread(threadId) {
+                scanResponseBuffers[threadId, default: ""] += text
+                return
+            }
+            guard threadId == currentThreadId else { return }
+            if let lastIndex = conversationHistory.indices.last,
+               conversationHistory[lastIndex].role == .assistant {
+                conversationHistory[lastIndex].content += text
+            } else {
+                conversationHistory.append(ChatMessage(role: .assistant, content: text))
+            }
             orbState = .speaking
             DispatchQueue.main.asyncAfter(deadline: .now() + 1) { [weak self] in
                 if self?.orbState == .speaking { self?.orbState = .idle }
@@ -328,7 +551,12 @@ final class AuraCoordinator: ObservableObject {
             let detail = "\(name) \(args.map { "\($0.key)=\($0.value)" }.joined(separator: " "))"
             conversationHistory.append(ChatMessage(role: .system, content: "🔧 \(detail)"))
             
-        case .error(let message):
+        case .error(let threadId, let message):
+            if nudgeEngine.isScanThread(threadId) {
+                scanResponseBuffers.removeValue(forKey: threadId)
+                return
+            }
+            guard threadId == currentThreadId else { return }
             orbState = .idle
             conversationHistory.append(ChatMessage(role: .error, content: message))
         }
@@ -368,7 +596,7 @@ enum ConnectionState {
 struct ChatMessage: Identifiable {
     let id = UUID()
     let role: Role
-    let content: String
+    var content: String
     
     enum Role {
         case user

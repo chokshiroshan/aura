@@ -3,11 +3,12 @@ import AppKit
 import ApplicationServices
 import AVFoundation
 
-/// Checks and requests the three macOS permissions Flow needs.
+/// Checks and requests the macOS permissions Aura needs.
 ///
 /// 1. Microphone — for audio capture
 /// 2. Accessibility — for global hotkey (CGEventTap) + text injection
 /// 3. Input Monitoring — for keystroke detection
+/// 4. Screen Recording — for screen context and vision
 final class PermissionsManager {
     static let shared = PermissionsManager()
 
@@ -17,9 +18,10 @@ final class PermissionsManager {
         let microphone: Bool
         let accessibility: Bool
         let inputMonitoring: Bool
+        let screenRecording: Bool
 
         var allGranted: Bool {
-            microphone && accessibility && inputMonitoring
+            microphone && accessibility && inputMonitoring && screenRecording
         }
 
         var missing: [String] {
@@ -27,6 +29,7 @@ final class PermissionsManager {
             if !microphone { list.append("Microphone") }
             if !accessibility { list.append("Accessibility") }
             if !inputMonitoring { list.append("Input Monitoring") }
+            if !screenRecording { list.append("Screen Recording") }
             return list
         }
     }
@@ -36,7 +39,8 @@ final class PermissionsManager {
         PermissionStatus(
             microphone: checkMicrophone(),
             accessibility: checkAccessibility(),
-            inputMonitoring: checkInputMonitoring()
+            inputMonitoring: checkInputMonitoring(),
+            screenRecording: checkScreenRecording()
         )
     }
 
@@ -90,6 +94,25 @@ final class PermissionsManager {
         return false
     }
 
+    /// Check Screen Recording permission.
+    func checkScreenRecording() -> Bool {
+        if #available(macOS 10.15, *) {
+            return CGPreflightScreenCaptureAccess()
+        }
+        return true
+    }
+
+    /// Request Screen Recording permission.
+    ///
+    /// macOS requires the user to restart the app after granting this.
+    @discardableResult
+    func requestScreenRecording() -> Bool {
+        if #available(macOS 10.15, *) {
+            return CGRequestScreenCaptureAccess()
+        }
+        return true
+    }
+
     /// Open System Settings to the Accessibility pane.
     func openAccessibilitySettings() {
         if let url = URL(string: "x-apple.systempreferences:com.apple.preference.security?Privacy_Accessibility") {
@@ -100,6 +123,13 @@ final class PermissionsManager {
     /// Open System Settings to the Input Monitoring pane.
     func openInputMonitoringSettings() {
         if let url = URL(string: "x-apple.systempreferences:com.apple.preference.security?Privacy_ListenEvent") {
+            NSWorkspace.shared.open(url)
+        }
+    }
+
+    /// Open System Settings to the Screen Recording pane.
+    func openScreenRecordingSettings() {
+        if let url = URL(string: "x-apple.systempreferences:com.apple.preference.security?Privacy_ScreenCapture") {
             NSWorkspace.shared.open(url)
         }
     }

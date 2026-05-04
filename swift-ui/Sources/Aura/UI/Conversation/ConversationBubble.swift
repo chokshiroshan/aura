@@ -57,6 +57,21 @@ struct ConversationBubble: View {
                 }
             }
             .frame(maxHeight: 280)
+
+            if case .authenticating = coordinator.connectionState {
+                Button(action: coordinator.loginWithChatGPT) {
+                    Label("Sign in with ChatGPT", systemImage: "person.badge.key.fill")
+                        .font(.system(size: 12, weight: .semibold))
+                        .foregroundColor(.white)
+                        .frame(maxWidth: .infinity)
+                        .padding(.vertical, 8)
+                        .background(Color.orbIdle.opacity(0.35))
+                        .clipShape(RoundedRectangle(cornerRadius: 8, style: .continuous))
+                }
+                .buttonStyle(.plain)
+                .padding(.horizontal, 14)
+                .padding(.bottom, 8)
+            }
             
             // Nudge (if active)
             if let nudge = coordinator.activeNudge {

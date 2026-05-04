@@ -15,6 +15,7 @@ final class ChatGPTBackend: AuraBackend {
 
     private let auth = ChatGPTAuth.shared
     private var realtimeClient: RealtimeClient?
+    private let audioCapture = AudioCapture()
     private var localMemory: [MemoryEntry] = []
 
     // MARK: - Connection
@@ -39,42 +40,64 @@ final class ChatGPTBackend: AuraBackend {
     }
 
     func disconnect() {
+        audioCapture.stop()
+        audioCapture.onAudioData = nil
+        realtimeClient?.disconnect()
         realtimeClient = nil
     }
 
     // MARK: - Realtime Connection
 
     private func connectRealtime() {
-        guard case .signedIn(let token) = auth.authState else {
-            onError?(BackendError.authenticationFailed("No token"))
-            return
-        }
+        Task {
+            guard let token = await auth.ensureValidToken() else {
+                await MainActor.run {
+                    onError?(BackendError.authenticationFailed("No token"))
+                }
+                return
+            }
 
-        let client = RealtimeClient(token: token)
-        client.onTranscript = { [weak self] text in
-            // Save to local memory
-            let entry = MemoryEntry(
-                id: UUID().uuidString,
-                content: text,
-                timestamp: Date(),
-                source: "chatgpt"
-            )
-            self?.localMemory.append(entry)
-            self?.onMemoryUpdate?(self?.localMemory ?? [])
-        }
-        client.onAudioResponse = { [weak self] in
-            DispatchQueue.main.async { self?.onAudioResponse?() }
-        }
-        client.onResponseDone = { [weak self] in
-            DispatchQueue.main.async { self?.onResponseDone?() }
-        }
-        client.onError = { [weak self] error in
-            DispatchQueue.main.async { self?.onError?(error) }
-        }
+            let client = RealtimeClient()
+            client.onFinalTranscript = { [weak self] text in
+                let entry = MemoryEntry(
+                    id: UUID().uuidString,
+                    content: text,
+                    timestamp: Date(),
+                    source: "chatgpt"
+                )
+                DispatchQueue.main.async {
+                    self?.localMemory.append(entry)
+                    self?.onMemoryUpdate?(self?.localMemory ?? [])
+                }
+            }
+            client.onAudioResponse = { [weak self] _ in
+                DispatchQueue.main.async { self?.onAudioResponse?() }
+            }
+            client.onResponseComplete = { [weak self] in
+                DispatchQueue.main.async { self?.onResponseDone?() }
+            }
+            client.onError = { [weak self] message in
+                DispatchQueue.main.async {
+                    self?.onError?(BackendError.authenticationFailed(message))
+                }
+            }
 
-        realtimeClient = client
-        client.connect()
-        onConnected?()
+            do {
+                try await client.connect(
+                    accessToken: token,
+                    mode: .dictation(language: FlowConfig.load().language),
+                    backendMode: true
+                )
+                await MainActor.run {
+                    realtimeClient = client
+                    onConnected?()
+                }
+            } catch {
+                await MainActor.run {
+                    onError?(error)
+                }
+            }
+        }
     }
 
     // MARK: - Text
@@ -92,11 +115,21 @@ final class ChatGPTBackend: AuraBackend {
     // MARK: - Audio
 
     func startAudioCapture() {
-        realtimeClient?.startAudioCapture()
+        audioCapture.onAudioData = { [weak self] data in
+            self?.realtimeClient?.sendAudio(data)
+        }
+
+        do {
+            try audioCapture.start()
+        } catch {
+            onError?(error)
+        }
     }
 
     func stopAudioCapture() {
-        realtimeClient?.stopAudioCapture()
+        audioCapture.stop()
+        audioCapture.onAudioData = nil
+        realtimeClient?.commitAndRespond()
     }
 
     // MARK: - Memory (local only)

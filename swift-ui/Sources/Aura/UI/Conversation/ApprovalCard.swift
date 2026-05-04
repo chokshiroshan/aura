@@ -13,17 +13,35 @@ struct ApprovalCard: View {
     enum ApprovalType {
         case command(shellCommand: String)
         case fileChange(path: String, change: String)
+
+        var iconName: String {
+            switch self {
+            case .command:
+                return "terminal"
+            case .fileChange:
+                return "doc.text"
+            }
+        }
+
+        var title: String {
+            switch self {
+            case .command:
+                return "Shell Command"
+            case .fileChange:
+                return "File Change"
+            }
+        }
     }
     
     var body: some View {
         VStack(alignment: .leading, spacing: 8) {
             // Header
             HStack(spacing: 6) {
-                Image(systemName: type == .command ? "terminal" : "doc.text")
+                Image(systemName: type.iconName)
                     .font(.system(size: 11))
                     .foregroundColor(.orange)
                 
-                Text(type == .command ? "Shell Command" : "File Change")
+                Text(type.title)
                     .font(.system(size: 11, weight: .semibold))
                     .foregroundColor(.white.opacity(0.7))
             }
