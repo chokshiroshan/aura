@@ -30,6 +30,7 @@ final class CodexClient {
     private var requestId: Int64 = 0
     private var pendingRequests: [Int64: CheckedContinuation<JSONValue, Error>] = [:]
     private var streamedAgentMessageItemIds = Set<String>()
+    private let stateQueue = DispatchQueue(label: "ai.orb.desktop.codexclient.state")
     private let decoder = JSONDecoder()
     private let encoder = JSONEncoder()
     
@@ -276,8 +277,37 @@ final class CodexClient {
     // MARK: - Low-Level JSON-RPC
     
     private func nextId() -> Int64 {
-        requestId += 1
-        return requestId
+        stateQueue.sync {
+            requestId += 1
+            return requestId
+        }
+    }
+
+    private func storePendingRequest(
+        id: Int64,
+        continuation: CheckedContinuation<JSONValue, Error>
+    ) {
+        stateQueue.sync {
+            pendingRequests[id] = continuation
+        }
+    }
+
+    private func takePendingRequest(id: Int64) -> CheckedContinuation<JSONValue, Error>? {
+        stateQueue.sync {
+            pendingRequests.removeValue(forKey: id)
+        }
+    }
+
+    private func markStreamedAgentMessageItem(_ itemId: String) {
+        stateQueue.sync {
+            streamedAgentMessageItemIds.insert(itemId)
+        }
+    }
+
+    private func hasStreamedAgentMessageItem(_ itemId: String) -> Bool {
+        stateQueue.sync {
+            streamedAgentMessageItemIds.contains(itemId)
+        }
     }
     
     private func sendRequest(method: String, params: [String: Any]) async throws -> JSONValue {
@@ -295,15 +325,19 @@ final class CodexClient {
         guard let jsonStr = String(data: data, encoding: .utf8) else {
             throw CodexError.serializationFailed
         }
+
+        guard let webSocket, isConnected else {
+            throw CodexError.notConnected
+        }
         
         return try await withCheckedThrowingContinuation { continuation in
-            pendingRequests[id] = continuation
+            storePendingRequest(id: id, continuation: continuation)
             
-            webSocket?.send(.string(jsonStr)) { [weak self] error in
-                if let error {
-                    self?.pendingRequests.removeValue(forKey: id)
-                    continuation.resume(throwing: error)
+            webSocket.send(.string(jsonStr)) { [weak self] error in
+                guard let error, let continuation = self?.takePendingRequest(id: id) else {
+                    return
                 }
+                continuation.resume(throwing: error)
             }
         }
     }
@@ -371,12 +405,12 @@ final class CodexClient {
         // Response to a request we sent
         if let id = obj["id"] as? Int64 {
             if let result = obj["result"] {
-                if let cont = pendingRequests.removeValue(forKey: id) {
+                if let cont = takePendingRequest(id: id) {
                     cont.resume(returning: result)
                 }
             } else if let error = obj["error"] as? [String: Any] {
                 let msg = error["message"] as? String ?? "Unknown error"
-                if let cont = pendingRequests.removeValue(forKey: id) {
+                if let cont = takePendingRequest(id: id) {
                     cont.resume(throwing: CodexError.serverError(msg))
                 }
             }
@@ -408,7 +442,7 @@ final class CodexClient {
             if let delta = params["delta"] as? String {
                 let threadId = params["threadId"] as? String ?? ""
                 if let itemId = params["itemId"] as? String {
-                    streamedAgentMessageItemIds.insert(itemId)
+                    markStreamedAgentMessageItem(itemId)
                 }
                 onTurnEvent?(.agentMessage(threadId: threadId, text: delta))
             }
@@ -421,7 +455,7 @@ final class CodexClient {
                 break
             }
             if let itemId = item["id"] as? String,
-               streamedAgentMessageItemIds.contains(itemId) {
+               hasStreamedAgentMessageItem(itemId) {
                 break
             }
             let threadId = params["threadId"] as? String ?? ""
