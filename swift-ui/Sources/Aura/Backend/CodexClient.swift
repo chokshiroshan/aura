@@ -129,11 +129,21 @@ final class CodexClient {
     // MARK: - Thread Management
     
     /// Create a new conversation thread
-    func startThread(cwd: String? = nil, instructions: String? = nil, config: [String: Any]? = nil) async throws -> ThreadInfo {
+    func startThread(
+        cwd: String? = nil,
+        instructions: String? = nil,
+        config: [String: Any]? = nil,
+        approvalPolicy: String? = nil,
+        sandbox: String? = nil,
+        approvalsReviewer: String? = nil
+    ) async throws -> ThreadInfo {
         var params: [String: Any] = [:]
         if let cwd { params["cwd"] = cwd }
-        if let instructions { params["baseInstructions"] = instructions }
+        if let instructions { params["developerInstructions"] = instructions }
         if let config { params["config"] = config }
+        if let approvalPolicy { params["approvalPolicy"] = approvalPolicy }
+        if let sandbox { params["sandbox"] = sandbox }
+        if let approvalsReviewer { params["approvalsReviewer"] = approvalsReviewer }
         
         let response = try await sendRequest(method: "thread/start", params: params)
         return ThreadInfo(from: response)
@@ -170,7 +180,7 @@ final class CodexClient {
             params: [
                 "threadId": threadId,
                 "input": input,
-                "effort": "low"
+                "effort": "medium"
             ]
         )
     }
@@ -281,9 +291,11 @@ final class CodexClient {
     
     /// Resolve a server request (approval)
     func resolveRequest(requestId: Any, result: [String: Any]) async throws {
-        let _ = try await sendRequest(
-            method: "__resolve__",
-            params: ["id": requestId, "result": result]
+        let approved = result["approved"] as? Bool ?? false
+        try await sendServerResponse(
+            id: requestId,
+            method: "item/commandExecution/requestApproval",
+            response: ["decision": approved ? "acceptForSession" : "decline"]
         )
     }
     
@@ -388,10 +400,11 @@ final class CodexClient {
         }
     }
 
-    private func sendServerResponse(id: Any, result: [String: Any]) async throws {
+    private func sendServerResponse(id: Any, method: String, response: [String: Any]) async throws {
         let data = try JSONSerialization.data(withJSONObject: [
+            "method": method,
             "id": id,
-            "result": result
+            "response": response
         ])
         guard let jsonStr = String(data: data, encoding: .utf8) else {
             throw CodexError.serializationFailed
@@ -517,7 +530,8 @@ final class CodexClient {
                     )
                     try await self.sendServerResponse(
                         id: id,
-                        result: [
+                        method: method,
+                        response: [
                             "accessToken": result.accessToken,
                             "chatgptAccountId": result.accountId,
                             "chatgptPlanType": result.planType ?? NSNull()
@@ -525,6 +539,114 @@ final class CodexClient {
                     )
                 } catch {
                     await self.sendServerError(id: id, message: error.localizedDescription)
+                }
+            }
+
+        case "item/commandExecution/requestApproval":
+            onTurnEvent?(.toolCall(name: "shell approval", args: approvalDisplayArgs(params)))
+            Task { [weak self] in
+                do {
+                    try await self?.sendServerResponse(
+                        id: id,
+                        method: method,
+                        response: ["decision": "acceptForSession"]
+                    )
+                } catch {
+                    await self?.sendServerError(id: id, message: error.localizedDescription)
+                }
+            }
+
+        case "item/fileChange/requestApproval":
+            onTurnEvent?(.toolCall(name: "file approval", args: approvalDisplayArgs(params)))
+            Task { [weak self] in
+                do {
+                    try await self?.sendServerResponse(
+                        id: id,
+                        method: method,
+                        response: ["decision": "acceptForSession"]
+                    )
+                } catch {
+                    await self?.sendServerError(id: id, message: error.localizedDescription)
+                }
+            }
+
+        case "item/permissions/requestApproval":
+            onTurnEvent?(.toolCall(name: "permission approval", args: approvalDisplayArgs(params)))
+            Task { [weak self] in
+                guard let self else { return }
+                do {
+                    let cwd = params["cwd"] as? String
+                    var fileSystem: [String: Any] = [:]
+                    if let cwd, !cwd.isEmpty {
+                        fileSystem["read"] = [cwd]
+                        fileSystem["write"] = [cwd]
+                    }
+                    try await self.sendServerResponse(
+                        id: id,
+                        method: method,
+                        response: [
+                            "permissions": [
+                                "network": ["enabled": true],
+                                "fileSystem": fileSystem
+                            ],
+                            "scope": "session"
+                        ]
+                    )
+                } catch {
+                    await self.sendServerError(id: id, message: error.localizedDescription)
+                }
+            }
+
+        case "mcpServer/elicitation/request":
+            onTurnEvent?(.toolCall(name: "mcp elicitation", args: approvalDisplayArgs(params)))
+            Task { [weak self] in
+                do {
+                    try await self?.sendServerResponse(
+                        id: id,
+                        method: method,
+                        response: [
+                            "action": "decline",
+                            "content": NSNull(),
+                            "_meta": NSNull()
+                        ]
+                    )
+                } catch {
+                    await self?.sendServerError(id: id, message: error.localizedDescription)
+                }
+            }
+
+        case "item/tool/requestUserInput":
+            Task { [weak self] in
+                do {
+                    try await self?.sendServerResponse(
+                        id: id,
+                        method: method,
+                        response: ["answers": [:]]
+                    )
+                } catch {
+                    await self?.sendServerError(id: id, message: error.localizedDescription)
+                }
+            }
+
+        case "item/tool/call":
+            onTurnEvent?(.toolCall(name: "client tool", args: approvalDisplayArgs(params)))
+            Task { [weak self] in
+                do {
+                    try await self?.sendServerResponse(
+                        id: id,
+                        method: method,
+                        response: [
+                            "contentItems": [
+                                [
+                                    "type": "inputText",
+                                    "text": "Aura has no client-side dynamic tool registered for this request."
+                                ]
+                            ],
+                            "success": false
+                        ]
+                    )
+                } catch {
+                    await self?.sendServerError(id: id, message: error.localizedDescription)
                 }
             }
 
@@ -548,6 +670,11 @@ final class CodexClient {
         case "turn/completed":
             onTurnEvent?(.completed(threadId: params["threadId"] as? String ?? ""))
 
+        case "item/started":
+            if let item = params["item"] as? [String: Any] {
+                handleItemProgress(item, threadId: params["threadId"] as? String ?? "", phase: "started")
+            }
+
         case "item/agentMessage/delta":
             if let delta = params["delta"] as? String {
                 let threadId = params["threadId"] as? String ?? ""
@@ -558,12 +685,14 @@ final class CodexClient {
             }
 
         case "item/completed":
-            guard let item = params["item"] as? [String: Any],
-                  item["type"] as? String == "agentMessage",
-                  let text = item["text"] as? String,
-                  !text.isEmpty else {
+            guard let item = params["item"] as? [String: Any] else {
                 break
             }
+            if item["type"] as? String != "agentMessage" {
+                handleItemProgress(item, threadId: params["threadId"] as? String ?? "", phase: "completed")
+                break
+            }
+            guard let text = item["text"] as? String, !text.isEmpty else { break }
             if let itemId = item["id"] as? String,
                hasStreamedAgentMessageItem(itemId) {
                 break
@@ -642,6 +771,35 @@ final class CodexClient {
         Task {
             try? await resolveRequest(requestId: requestId, result: ["approved": true])
         }
+    }
+
+    private func approvalDisplayArgs(_ params: [String: Any]) -> [String: Any] {
+        var args: [String: Any] = [:]
+        for key in ["command", "cwd", "reason", "serverName", "tool"] {
+            if let value = params[key] {
+                args[key] = value
+            }
+        }
+        return args
+    }
+
+    private func handleItemProgress(_ item: [String: Any], threadId: String, phase: String) {
+        guard let type = item["type"] as? String,
+              type != "agentMessage",
+              type != "reasoning" else {
+            return
+        }
+
+        var args: [String: Any] = ["phase": phase]
+        for key in ["command", "cwd", "tool", "serverName", "status"] {
+            if let value = item[key] {
+                args[key] = value
+            }
+        }
+        if !threadId.isEmpty {
+            args["threadId"] = threadId
+        }
+        onTurnEvent?(.toolCall(name: type, args: args))
     }
 }
 

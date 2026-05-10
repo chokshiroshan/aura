@@ -42,6 +42,15 @@ final class ChatGPTAuth: @unchecked Sendable, ObservableObject {
 
     init() {
         // Restore existing session
+        if let tokens = Self.tokensFromCodexAuthFile(), !tokens.isExpired {
+            try? keychain.saveTokens(tokens)
+            let email = Self.extractEmailFromJWT(tokens.idToken ?? tokens.accessToken)
+            self.accessToken = tokens.accessToken
+            self.userEmail = email
+            self.authState = .signedIn(email: email ?? "ChatGPT User", plan: tokens.plan ?? "ChatGPT")
+            return
+        }
+
         if let tokens = keychain.loadTokens(), !tokens.isExpired {
             let email = Self.extractEmailFromJWT(tokens.accessToken)
             self.accessToken = tokens.accessToken
@@ -180,9 +189,16 @@ final class ChatGPTAuth: @unchecked Sendable, ObservableObject {
     }
 
     func ensureValidToken() async -> String? {
+        if let tokens = Self.tokensFromCodexAuthFile(), !tokens.isExpired {
+            try? keychain.saveTokens(tokens)
+            accessToken = tokens.accessToken
+            return accessToken
+        }
+
         // If token is still valid, return it
         if let tokens = keychain.loadTokens(), !tokens.isExpired {
             accessToken = tokens.accessToken
+            _ = currentChatGPTAccountId()
             return accessToken
         }
 
@@ -196,6 +212,36 @@ final class ChatGPTAuth: @unchecked Sendable, ObservableObject {
             self.authState = .signedOut
         }
         return nil
+    }
+
+    func currentChatGPTAccountId() -> String? {
+        guard let tokens = keychain.loadTokens() else {
+            return Self.accountIdFromCodexAuthFile()
+        }
+
+        if let accountId = tokens.chatgptAccountId, !accountId.isEmpty {
+            return accountId
+        }
+
+        let recoveredAccountId = tokens.idToken.flatMap(Self.extractChatGPTAccountId)
+            ?? Self.extractChatGPTAccountId(from: tokens.accessToken)
+            ?? Self.accountIdFromCodexAuthFile()
+
+        guard let recoveredAccountId, !recoveredAccountId.isEmpty else {
+            return nil
+        }
+
+        let repaired = KeychainStore.AuthTokens(
+            accessToken: tokens.accessToken,
+            refreshToken: tokens.refreshToken,
+            idToken: tokens.idToken,
+            expiresAt: tokens.expiresAt,
+            email: tokens.email,
+            plan: tokens.plan,
+            chatgptAccountId: recoveredAccountId
+        )
+        try? keychain.saveTokens(repaired)
+        return recoveredAccountId
     }
 
     // MARK: - OAuth Token Exchange (matching Codex's exchange_code_for_tokens)
@@ -238,8 +284,9 @@ final class ChatGPTAuth: @unchecked Sendable, ObservableObject {
         let expiresIn = json["expires_in"] as? TimeInterval ?? 3600
         let idToken = json["id_token"] as? String
         let email = Self.extractEmailFromJWT(idToken ?? accessToken)
-        let accountId = idToken.flatMap { Self.extractAuthClaim("chatgpt_account_id", from: $0) }
-            ?? Self.extractAuthClaim("chatgpt_account_id", from: accessToken)
+        let accountId = idToken.flatMap(Self.extractChatGPTAccountId)
+            ?? Self.extractChatGPTAccountId(from: accessToken)
+            ?? Self.accountIdFromCodexAuthFile()
         let plan = idToken.flatMap { Self.extractAuthClaim("chatgpt_plan_type", from: $0) }
             ?? Self.extractAuthClaim("chatgpt_plan_type", from: accessToken)
 
@@ -291,8 +338,9 @@ final class ChatGPTAuth: @unchecked Sendable, ObservableObject {
         let expiresIn = json["expires_in"] as? TimeInterval ?? 3600
         let idToken = json["id_token"] as? String
         let email = Self.extractEmailFromJWT(idToken ?? accessToken)
-        let accountId = idToken.flatMap { Self.extractAuthClaim("chatgpt_account_id", from: $0) }
-            ?? Self.extractAuthClaim("chatgpt_account_id", from: accessToken)
+        let accountId = idToken.flatMap(Self.extractChatGPTAccountId)
+            ?? Self.extractChatGPTAccountId(from: accessToken)
+            ?? Self.accountIdFromCodexAuthFile()
         let plan = idToken.flatMap { Self.extractAuthClaim("chatgpt_plan_type", from: $0) }
             ?? Self.extractAuthClaim("chatgpt_plan_type", from: accessToken)
 
@@ -353,6 +401,62 @@ final class ChatGPTAuth: @unchecked Sendable, ObservableObject {
         guard let claims = jwtClaims(jwt) else { return nil }
         let auth = claims["https://api.openai.com/auth"] as? [String: Any]
         return auth?[key] as? String ?? claims[key] as? String
+    }
+
+    private static func extractChatGPTAccountId(from jwt: String) -> String? {
+        extractAuthClaim("chatgpt_account_id", from: jwt)
+            ?? extractAuthClaim("account_id", from: jwt)
+    }
+
+    private static func accountIdFromCodexAuthFile() -> String? {
+        tokensFromCodexAuthFile()?.chatgptAccountId
+    }
+
+    private static func tokensFromCodexAuthFile() -> KeychainStore.AuthTokens? {
+        let authURL = FileManager.default.homeDirectoryForCurrentUser
+            .appendingPathComponent(".codex")
+            .appendingPathComponent("auth.json")
+
+        guard let data = try? Data(contentsOf: authURL),
+              let json = try? JSONSerialization.jsonObject(with: data) as? [String: Any],
+              let tokens = json["tokens"] as? [String: Any],
+              let accessToken = tokens["access_token"] as? String else {
+            return nil
+        }
+
+        let refreshToken = tokens["refresh_token"] as? String ?? ""
+        let idToken = tokens["id_token"] as? String
+        let accountId = (tokens["account_id"] as? String).flatMap { $0.isEmpty ? nil : $0 }
+            ?? idToken.flatMap(extractChatGPTAccountId)
+            ?? extractChatGPTAccountId(from: accessToken)
+        guard let accountId, !accountId.isEmpty else { return nil }
+
+        let email = idToken.flatMap(extractEmailFromJWT)
+            ?? extractEmailFromJWT(accessToken)
+        let plan = idToken.flatMap { extractAuthClaim("chatgpt_plan_type", from: $0) }
+            ?? extractAuthClaim("chatgpt_plan_type", from: accessToken)
+        let expiresAt = jwtExpiryDate(accessToken) ?? Date().addingTimeInterval(3000)
+
+        return KeychainStore.AuthTokens(
+            accessToken: accessToken,
+            refreshToken: refreshToken,
+            idToken: idToken,
+            expiresAt: expiresAt,
+            email: email,
+            plan: plan ?? "ChatGPT",
+            chatgptAccountId: accountId
+        )
+    }
+
+    private static func jwtExpiryDate(_ jwt: String) -> Date? {
+        guard let claims = jwtClaims(jwt) else { return nil }
+        if let exp = claims["exp"] as? TimeInterval {
+            return Date(timeIntervalSince1970: exp)
+        }
+        if let exp = claims["exp"] as? Int {
+            return Date(timeIntervalSince1970: TimeInterval(exp))
+        }
+        return nil
     }
 
     private static func jwtClaims(_ jwt: String) -> [String: Any]? {

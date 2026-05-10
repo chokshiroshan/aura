@@ -17,6 +17,7 @@ final class AudioCapture {
 
     static let targetSampleRate: Double = 24000.0
     var onAudioData: ((Data) -> Void)?
+    var onLevel: ((Float) -> Void)?  // 0..1 RMS per buffer
     var isRunning: Bool { procID != nil }
 
     // MARK: - Device Discovery
@@ -197,15 +198,19 @@ final class AudioCapture {
         let outputCount = Int(Float(frameCount) * ratio)
         guard outputCount > 0 else { return }
 
+        var sumSquares: Float = 0
         var pcm16 = Data(capacity: outputCount * 2)
         for i in 0..<outputCount {
             let srcIdx = min(Int(Float(i) / ratio), frameCount - 1)
             let sample = floatPtr[srcIdx]
             let clamped = max(-1.0, min(1.0, sample))
+            sumSquares += clamped * clamped
             let intSample = Int16(clamped * 32767.0)
             pcm16.append(contentsOf: withUnsafeBytes(of: intSample.littleEndian) { Array($0) })
         }
 
+        let rms = sqrtf(sumSquares / Float(outputCount))
+        emitLevel(rms)
         emitChunk(pcm16, inputFrames: frameCount, outputFrames: outputCount)
     }
 
@@ -218,13 +223,25 @@ final class AudioCapture {
         let outputCount = Int(Float(frameCount) * ratio)
         guard outputCount > 0 else { return }
 
+        var sumSquares: Float = 0
         var pcm16 = Data(capacity: outputCount * 2)
         for i in 0..<outputCount {
             let srcIdx = min(Int(Float(i) / ratio), frameCount - 1)
+            let sample = Float(int16Ptr[srcIdx]) / 32767.0
+            sumSquares += sample * sample
             pcm16.append(contentsOf: withUnsafeBytes(of: int16Ptr[srcIdx].littleEndian) { Array($0) })
         }
 
+        let rms = sqrtf(sumSquares / Float(outputCount))
+        emitLevel(rms)
         emitChunk(pcm16, inputFrames: frameCount, outputFrames: outputCount)
+    }
+
+    private func emitLevel(_ rms: Float) {
+        guard let onLevel else { return }
+        // Speech RMS typically peaks around 0.2–0.4. Map to 0..1 with a gentle gain.
+        let normalized = min(1.0, rms * 3.5)
+        DispatchQueue.main.async { onLevel(normalized) }
     }
 
     private func emitChunk(_ data: Data, inputFrames: Int, outputFrames: Int) {

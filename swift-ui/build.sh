@@ -45,6 +45,14 @@ mkdir -p "$APP_BUNDLE/Contents/Resources"
 cp "$BINARY" "$APP_BUNDLE/Contents/MacOS/$APP_NAME"
 chmod +x "$APP_BUNDLE/Contents/MacOS/$APP_NAME"
 
+RESOURCE_BUNDLE="$(find .build -path "*/release/Aura_Aura.bundle" -type d | head -n 1)"
+if [[ -d "$RESOURCE_BUNDLE" ]]; then
+    cp -R "$RESOURCE_BUNDLE" "$APP_BUNDLE/Contents/Resources/$(basename "$RESOURCE_BUNDLE")"
+fi
+if [[ -d "Sources/Aura/Resources/CatMemes" ]]; then
+    cp -R "Sources/Aura/Resources/CatMemes" "$APP_BUNDLE/Contents/Resources/CatMemes"
+fi
+
 if [[ -z "$CODEX_APP_SERVER_PATH" ]]; then
     for candidate in \
         "$HOME/codex-source/codex-rs/target/aarch64-apple-darwin/release/codex-app-server" \

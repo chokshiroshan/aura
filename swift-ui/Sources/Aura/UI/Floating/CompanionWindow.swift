@@ -1,4 +1,65 @@
 import SwiftUI
+import AppKit
+
+/// Tracks cursor position relative to the companion panel so the mascot can
+/// "lean" toward the cursor when it's nearby. Vector is normalized into
+/// -1..1 (clamped at 300pt screen distance).
+@MainActor
+final class CursorTracker: ObservableObject {
+    @Published var vector: CGVector = .zero
+
+    private var monitor: Any?
+    private var anchor: CGPoint = .zero
+    private let radius: CGFloat = 300
+    private var lastUpdate: TimeInterval = 0
+
+    func start(anchor: CGPoint) {
+        self.anchor = anchor
+        if monitor != nil { return }
+        monitor = NSEvent.addGlobalMonitorForEvents(matching: .mouseMoved) { [weak self] event in
+            self?.handle(event)
+        }
+    }
+
+    func updateAnchor(_ anchor: CGPoint) {
+        self.anchor = anchor
+    }
+
+    func stop() {
+        if let monitor {
+            NSEvent.removeMonitor(monitor)
+        }
+        monitor = nil
+    }
+
+    private func handle(_ event: NSEvent) {
+        // Throttle ~30 Hz
+        let now = ProcessInfo.processInfo.systemUptime
+        if now - lastUpdate < 0.033 { return }
+        lastUpdate = now
+
+        let mouse = NSEvent.mouseLocation  // screen coords
+        let dx = mouse.x - anchor.x
+        let dy = mouse.y - anchor.y
+        let dist = sqrt(dx * dx + dy * dy)
+        if dist > radius {
+            Task { @MainActor [weak self] in self?.vector = .zero }
+            return
+        }
+        // Normalize to -1..1
+        let nx = max(-1, min(1, dx / radius))
+        let ny = max(-1, min(1, dy / radius))
+        Task { @MainActor [weak self] in
+            self?.vector = CGVector(dx: nx, dy: ny)
+        }
+    }
+
+    deinit {
+        if let monitor {
+            NSEvent.removeMonitor(monitor)
+        }
+    }
+}
 
 /// The floating companion — orb with expandable conversation.
 ///
@@ -43,31 +104,35 @@ final class CompanionWindowController {
 // MARK: - Panel
 
 final class CompanionPanel: NSPanel {
-    private let orbSize: CGFloat = 100
+    private let orbSize: CGFloat = 140
     private let bubbleWidth: CGFloat = 340
     private let maxBubbleHeight: CGFloat = 420
-    
+
     private let coordinator: AuraCoordinator
     let screenFrame: NSRect
     private var isExpanded = false
-    
+    private let cursorTracker = CursorTracker()
+
     // Orb
     private let orbHosting: ClickableHostingView<AuraCompanionView>
-    
+
     // Conversation bubble
     private let bubblePanel: NSPanel
-    
+
     init(for screen: NSScreen, coordinator: AuraCoordinator) {
         self.coordinator = coordinator
         self.screenFrame = screen.visibleFrame
-        
-        let size = CGSize(width: orbSize, height: orbSize)
+
+        let size = CGSize(width: 140, height: 140)
         let origin = CGPoint(
             x: screen.visibleFrame.maxX - size.width - 20,
             y: screen.visibleFrame.minY + 20
         )
-        
-        self.orbHosting = ClickableHostingView(rootView: AuraCompanionView(coordinator: coordinator))
+
+        let tracker = self.cursorTracker
+        self.orbHosting = ClickableHostingView(
+            rootView: AuraCompanionView(coordinator: coordinator, cursorTracker: tracker)
+        )
         
         // Conversation bubble — separate panel so it can be positioned independently
         let bubbleFrame = NSRect(x: 0, y: 0, width: bubbleWidth, height: maxBubbleHeight)
@@ -106,6 +171,10 @@ final class CompanionPanel: NSPanel {
         }
         makeKeyAndOrderFront(nil)
         orderFrontRegardless()
+
+        // Cursor tracker: anchor at panel center
+        let center = CGPoint(x: origin.x + size.width / 2, y: origin.y + size.height / 2)
+        cursorTracker.start(anchor: center)
     }
 
     var isConversationExpanded: Bool { isExpanded }

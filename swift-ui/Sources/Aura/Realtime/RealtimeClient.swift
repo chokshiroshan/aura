@@ -15,6 +15,8 @@ final class RealtimeClient {
     var onDisconnected: (() -> Void)?
     var onPartialTranscript: ((String) -> Void)?
     var onFinalTranscript: ((String) -> Void)?
+    var onResponseTextDelta: ((String) -> Void)?
+    var onResponseTextDone: ((String) -> Void)?
     var onAudioResponse: ((Data) -> Void)?
     var onSpeechStarted: (() -> Void)?
     var onSpeechEnded: (() -> Void)?
@@ -25,25 +27,37 @@ final class RealtimeClient {
 
     private var webSocket: URLSessionWebSocketTask?
     private(set) var isConnected = false
-    private var partialText = ""
+    private var transcriptText = ""
+    private var responseText = ""
+    private var usesRealtimeV2 = false
 
     // MARK: - Connection
 
     enum ConnectionMode {
         case dictation(language: String)
+        case conversation(instructions: String, voice: String? = nil, outputAudio: Bool = false)
     }
 
-    func connect(accessToken: String, model: String = FlowConfig.load().realtimeModel, mode: ConnectionMode, backendMode: Bool = false) async throws {
+    func connect(
+        accessToken: String,
+        accountId: String? = nil,
+        sessionId: String = UUID().uuidString.lowercased(),
+        model: String = FlowConfig.load().realtimeModel,
+        mode: ConnectionMode,
+        backendMode: Bool = false
+    ) async throws {
         // backendMode = ChatGPT subscription (free, via Codex OAuth)
         // !backendMode = paid API endpoint (api.openai.com, costs tokens)
+        let encodedModel = model.addingPercentEncoding(withAllowedCharacters: .urlQueryAllowed) ?? model
         let urlString: String
         if backendMode {
-            // Free path: ChatGPT backend via subscription token
-            // Same endpoint Codex CLI uses — unlimited tokens, $0 cost
-            urlString = "wss://chatgpt.com/backend-api/codex/realtime"
+            // ChatGPT subscription auth uses the OpenAI realtime gateway with
+            // ChatGPT account headers. This mirrors Codex's realtime path and
+            // avoids chatgpt.com browser challenge protection on raw sockets.
+            urlString = "wss://api.openai.com/v1/realtime?model=\(encodedModel)"
         } else {
             // Paid path: direct OpenAI API (requires API key, costs per token)
-            urlString = "wss://api.openai.com/v1/realtime?model=\(model)"
+            urlString = "wss://api.openai.com/v1/realtime?model=\(encodedModel)"
         }
 
         guard let url = URL(string: urlString) else {
@@ -52,9 +66,14 @@ final class RealtimeClient {
 
         var request = URLRequest(url: url)
         request.setValue("Bearer \(accessToken)", forHTTPHeaderField: "Authorization")
+        request.setValue(sessionId, forHTTPHeaderField: "x-session-id")
+        if let accountId, !accountId.isEmpty {
+            request.setValue(accountId, forHTTPHeaderField: "ChatGPT-Account-ID")
+        }
         if !backendMode {
             request.setValue("realtime=v1", forHTTPHeaderField: "OpenAI-Beta")
         }
+        usesRealtimeV2 = backendMode
 
         print("🔌 Connecting to Realtime API: \(urlString) (backend: \(backendMode))")
 
@@ -81,7 +100,8 @@ final class RealtimeClient {
         isConnected = false
         webSocket?.cancel(with: .normalClosure, reason: nil)
         webSocket = nil
-        partialText = ""
+        transcriptText = ""
+        responseText = ""
         onDisconnected?()
         print("🔌 Disconnected from Realtime API")
     }
@@ -135,6 +155,97 @@ final class RealtimeClient {
             print("📋 transcription_prompt: \(config.transcriptionPrompt ?? "nil")")
             print("📋 instructions (first 200): \(instructions.prefix(200))\(instructions.count > 200 ? "..." : "")")
             print("📋 ═══════════════════════════")
+
+        case .conversation(let instructions, let voice, let outputAudio):
+            let config = FlowConfig.load()
+            let selectedVoice = voice ?? "marin"
+
+            if usesRealtimeV2 {
+                let outputModality = outputAudio ? "audio" : "text"
+                let outputConfig = """
+                "output": {
+                    "format": { "type": "audio/pcm", "rate": 24000 },
+                    "voice": "\(selectedVoice.escapingJSON)"
+                }
+                """
+
+                sessionConfig = """
+                {
+                    "type": "session.update",
+                    "session": {
+                        "type": "realtime",
+                        "instructions": "\(instructions.escapingJSON)",
+                        "output_modalities": ["\(outputModality)"],
+                        "audio": {
+                            "input": {
+                                "format": { "type": "audio/pcm", "rate": 24000 },
+                                "noise_reduction": { "type": "near_field" },
+                                "transcription": { "model": "\(config.transcriptionModel.escapingJSON)" },
+                                "turn_detection": {
+                                    "type": "server_vad",
+                                    "interrupt_response": true,
+                                    "create_response": true,
+                                    "silence_duration_ms": 500
+                                }
+                            },
+                            \(outputConfig)
+                        }
+                    }
+                }
+                """
+
+                print("📋 ═══ CONVERSATION SESSION CONFIG (V2) ═══")
+                print("📋 model: \(config.realtimeModel)")
+                print("📋 output_modality: \(outputModality)")
+                print("📋 voice: \(selectedVoice)")
+                print("📋 transcription_model: \(config.transcriptionModel)")
+                print("📋 turn_detection: server_vad")
+                print("📋 instructions (first 200): \(instructions.prefix(200))\(instructions.count > 200 ? "..." : "")")
+                print("📋 ═════════════════════════════════════")
+                break
+            }
+
+            var transConfig = """
+            {"model":"\(config.transcriptionModel)","language":"\(config.language)"
+            """
+            if let prompt = config.transcriptionPrompt, !prompt.isEmpty {
+                transConfig += ",\"prompt\":\"\(prompt.escapingJSON)\""
+            }
+            transConfig += "}"
+
+            var noiseReductionConfig = ""
+            if let nr = config.inputAudioNoiseReduction {
+                noiseReductionConfig = ",\"input_audio_noise_reduction\":{\"type\":\"\(nr)\"}"
+            }
+
+            sessionConfig = """
+            {
+                "type": "session.update",
+                "session": {
+                    "modalities": ["text", "audio"],
+                    "instructions": "\(instructions.escapingJSON)",
+                    "voice": "\(selectedVoice.escapingJSON)",
+                    "input_audio_format": "\(config.inputAudioFormat)",
+                    "output_audio_format": "\(config.outputAudioFormat)",
+                    "input_audio_transcription": \(transConfig),
+                    "turn_detection": {
+                        "type": "server_vad",
+                        "create_response": true,
+                        "interrupt_response": true
+                    },
+                    "max_response_output_tokens": \(config.maxResponseOutputTokens),
+                    "temperature": \(config.temperature)\(noiseReductionConfig)
+                }
+            }
+            """
+
+            print("📋 ═══ CONVERSATION SESSION CONFIG ═══")
+            print("📋 model: \(config.realtimeModel)")
+            print("📋 voice: \(selectedVoice)")
+            print("📋 transcription_model: \(config.transcriptionModel)")
+            print("📋 turn_detection: server_vad")
+            print("📋 instructions (first 200): \(instructions.prefix(200))\(instructions.count > 200 ? "..." : "")")
+            print("📋 ═════════════════════════════════")
         }
 
         try send(sessionConfig)
@@ -163,6 +274,53 @@ final class RealtimeClient {
         try? send("""
         {"type":"response.create","response":{"modalities":["text"]}}
         """)
+    }
+
+    func sendUserText(_ text: String, imagePath: String? = nil, createResponse: Bool = true, outputAudio: Bool = true) {
+        guard isConnected else { return }
+        do {
+            var content = """
+            [{"type":"input_text","text":"\(text.escapingJSON)"}]
+            """
+            if let imagePath,
+               let data = try? Data(contentsOf: URL(fileURLWithPath: imagePath)) {
+                let imageURL = "data:image/png;base64,\(data.base64EncodedString())"
+                content = """
+                [{"type":"input_text","text":"\(text.escapingJSON)"},{"type":"input_image","image_url":"\(imageURL)","detail":"low"}]
+                """
+            }
+
+            try send("""
+            {"type":"conversation.item.create","item":{"type":"message","role":"user","content":\(content)}}
+            """)
+
+            if createResponse {
+                createConversationResponse(outputAudio: outputAudio)
+            }
+        } catch {
+            print("⚠️ Failed to send realtime text: \(error.localizedDescription)")
+            onError?(error.localizedDescription)
+        }
+    }
+
+    func sendScreenContext(imagePath: String?, reason: String) {
+        let text = "Screen context update (\(reason)). Use this only as current context. Do not respond just to acknowledge it."
+        sendUserText(text, imagePath: imagePath, createResponse: false)
+    }
+
+    func createConversationResponse(outputAudio: Bool = true) {
+        guard isConnected else { return }
+        responseText = ""
+        if usesRealtimeV2 {
+            try? send("""
+            {"type":"response.create"}
+            """)
+        } else {
+            let modalities = outputAudio ? #""text","audio""# : #""text""#
+            try? send("""
+            {"type":"response.create","response":{"modalities":[\(modalities)]}}
+            """)
+        }
     }
 
     /// Update session instructions with current context (active app, etc.)
@@ -293,31 +451,81 @@ final class RealtimeClient {
         // This is the server-side transcription of what was actually spoken.
         case "conversation.item.input_audio_transcription.delta":
             if let delta = obj["delta"] as? String {
-                partialText += delta
-                onPartialTranscript?(partialText)
+                transcriptText += delta
+                onPartialTranscript?(transcriptText)
             }
 
         case "conversation.item.input_audio_transcription.completed":
             if let t = obj["transcript"] as? String {
-                partialText = t
+                transcriptText = t
                 onFinalTranscript?(t)
+                transcriptText = ""
             }
 
-        // Response text (model output — fallback if no transcription event)
+        // Response text (model output)
         case "response.text.delta":
-            if let delta = obj["delta"] as? String, partialText.isEmpty {
-                partialText += delta
-                onPartialTranscript?(partialText)
+            if let delta = obj["delta"] as? String {
+                responseText += delta
+                onResponseTextDelta?(delta)
+            }
+        case "response.output_text.delta":
+            if let delta = obj["delta"] as? String {
+                responseText += delta
+                onResponseTextDelta?(delta)
             }
 
         case "response.text.done":
-            if let t = obj["text"] as? String, partialText.isEmpty {
-                partialText = t
-                onFinalTranscript?(t)
+            if let t = obj["text"] as? String {
+                onResponseTextDone?(t)
+                responseText = ""
+            } else if !responseText.isEmpty {
+                onResponseTextDone?(responseText)
+                responseText = ""
+            }
+        case "response.output_text.done":
+            if let t = obj["text"] as? String {
+                onResponseTextDone?(t)
+                responseText = ""
+            } else if !responseText.isEmpty {
+                onResponseTextDone?(responseText)
+                responseText = ""
+            }
+
+        case "response.audio_transcript.delta":
+            if let delta = obj["delta"] as? String {
+                responseText += delta
+                onResponseTextDelta?(delta)
+            }
+        case "response.output_audio_transcript.delta":
+            if let delta = obj["delta"] as? String {
+                responseText += delta
+                onResponseTextDelta?(delta)
+            }
+
+        case "response.audio_transcript.done":
+            if let transcript = obj["transcript"] as? String {
+                onResponseTextDone?(transcript)
+                responseText = ""
+            } else if !responseText.isEmpty {
+                onResponseTextDone?(responseText)
+                responseText = ""
+            }
+        case "response.output_audio_transcript.done":
+            if let transcript = obj["transcript"] as? String {
+                onResponseTextDone?(transcript)
+                responseText = ""
+            } else if !responseText.isEmpty {
+                onResponseTextDone?(responseText)
+                responseText = ""
             }
 
         // Response audio (future voice chat mode)
         case "response.audio.delta":
+            if let b64 = obj["delta"] as? String,
+               let audioData = Data(base64Encoded: b64) {
+                onAudioResponse?(audioData)
+            }
+        case "response.output_audio.delta":
             if let b64 = obj["delta"] as? String,
                let audioData = Data(base64Encoded: b64) {
                 onAudioResponse?(audioData)
@@ -333,7 +541,8 @@ final class RealtimeClient {
         // Response lifecycle
         case "response.done":
             onResponseComplete?()
-            partialText = ""
+            transcriptText = ""
+            responseText = ""
 
         // Speech detection
         case "input_audio_buffer.speech_started":

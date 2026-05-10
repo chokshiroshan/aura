@@ -13,6 +13,7 @@ final class AudioPlayer {
     private var isPlaying = false
     
     var onPlaybackFinished: (() -> Void)?
+    var onLevel: ((Float) -> Void)?  // 0..1 RMS per buffer
     
     init() {
         self.format = AVAudioFormat(
@@ -61,7 +62,21 @@ final class AudioPlayer {
                 buffer.int16ChannelData?.pointee.update(from: baseAddress.assumingMemoryBound(to: Int16.self), count: Int(frameCount))
             }
         }
-        
+
+        if let onLevel {
+            var sumSquares: Float = 0
+            pcmData.withUnsafeBytes { raw in
+                guard let base = raw.baseAddress?.assumingMemoryBound(to: Int16.self) else { return }
+                for i in 0..<Int(frameCount) {
+                    let s = Float(base[i]) / 32767.0
+                    sumSquares += s * s
+                }
+            }
+            let rms = sqrtf(sumSquares / Float(frameCount))
+            let normalized = min(1.0, rms * 3.5)
+            DispatchQueue.main.async { onLevel(normalized) }
+        }
+
         playerNode.scheduleBuffer(buffer) { [weak self] in
             // Buffer consumed
         }
