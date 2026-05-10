@@ -100,7 +100,7 @@ struct FlowConfig: Codable {
     // Full control over everything sent to session.update
 
     /// The realtime model to use for the WebSocket connection.
-    var realtimeModel: String = "gpt-realtime-1.5"
+    var realtimeModel: String = "gpt-realtime-2"
 
     /// Which STT model to use for input_audio_transcription.
     /// Options: "gpt-4o-transcribe", "gpt-4o-transcribe-diarize", "gpt-4o-mini-transcribe", "whisper-1"

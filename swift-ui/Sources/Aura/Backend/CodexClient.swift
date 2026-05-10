@@ -8,6 +8,11 @@ import Foundation
 ///
 /// Protocol docs: codex-rs/app-server-protocol/src/protocol/common.rs
 final class CodexClient {
+    struct ChatGPTAuthTokensRefreshResult {
+        let accessToken: String
+        let accountId: String
+        let planType: String?
+    }
     
     // MARK: - Callbacks
     var onConnected: (() -> Void)?
@@ -23,6 +28,7 @@ final class CodexClient {
     var onRealtimeAudio: ((String, Data) -> Void)?
     var onRealtimeError: ((String, String) -> Void)?
     var onRealtimeClosed: ((String, String?) -> Void)?
+    var onChatGPTAuthTokensRefresh: ((String?, String) async throws -> ChatGPTAuthTokensRefreshResult)?
     
     // MARK: - State
     private var webSocket: URLSessionWebSocketTask?
@@ -30,7 +36,7 @@ final class CodexClient {
     private var requestId: Int64 = 0
     private var pendingRequests: [Int64: CheckedContinuation<JSONValue, Error>] = [:]
     private var streamedAgentMessageItemIds = Set<String>()
-    private let stateQueue = DispatchQueue(label: "ai.orb.desktop.codexclient.state")
+    private let stateQueue = DispatchQueue(label: "ai.aura.desktop.codexclient.state")
     private let decoder = JSONDecoder()
     private let encoder = JSONEncoder()
     
@@ -100,6 +106,24 @@ final class CodexClient {
             params: ["type": "chatgpt", "codexStreamlinedLogin": true]
         )
         return LoginResult(from: response)
+    }
+
+    /// Install ChatGPT OAuth tokens that Aura obtained through its own localhost callback.
+    func loginWithChatGPTAuthTokens(accessToken: String, accountId: String, planType: String?) async throws {
+        var params: [String: Any] = [
+            "type": "chatgptAuthTokens",
+            "accessToken": accessToken,
+            "chatgptAccountId": accountId
+        ]
+        if let planType {
+            params["chatgptPlanType"] = planType
+        }
+        let _ = try await sendRequest(method: "account/login/start", params: params)
+    }
+
+    /// Clear the current Codex account so the next login can use a different ChatGPT account.
+    func logoutAccount() async throws {
+        let _ = try await sendRequest(method: "account/logout", params: [:])
     }
     
     // MARK: - Thread Management
@@ -363,6 +387,46 @@ final class CodexClient {
             }
         }
     }
+
+    private func sendServerResponse(id: Any, result: [String: Any]) async throws {
+        let data = try JSONSerialization.data(withJSONObject: [
+            "id": id,
+            "result": result
+        ])
+        guard let jsonStr = String(data: data, encoding: .utf8) else {
+            throw CodexError.serializationFailed
+        }
+
+        try await withCheckedThrowingContinuation { (continuation: CheckedContinuation<Void, Error>) in
+            webSocket?.send(.string(jsonStr)) { error in
+                if let error {
+                    continuation.resume(throwing: error)
+                } else {
+                    continuation.resume()
+                }
+            }
+        }
+    }
+
+    private func sendServerError(id: Any, message: String) async {
+        let payload: [String: Any] = [
+            "id": id,
+            "error": [
+                "code": -32000,
+                "message": message
+            ]
+        ]
+        guard let data = try? JSONSerialization.data(withJSONObject: payload),
+              let jsonStr = String(data: data, encoding: .utf8) else {
+            return
+        }
+
+        webSocket?.send(.string(jsonStr)) { error in
+            if let error {
+                print("⚠️ Failed to send server-request error: \(error.localizedDescription)")
+            }
+        }
+    }
     
     // MARK: - Receiving
     
@@ -402,8 +466,14 @@ final class CodexClient {
             return
         }
         
+        // Request initiated by the server.
+        if let id = obj["id"], let method = obj["method"] as? String {
+            handleServerRequest(id: id, method: method, params: obj["params"] as? [String: Any] ?? [:])
+            return
+        }
+
         // Response to a request we sent
-        if let id = obj["id"] as? Int64 {
+        if let id = Self.requestId(from: obj["id"]) {
             if let result = obj["result"] {
                 if let cont = takePendingRequest(id: id) {
                     cont.resume(returning: result)
@@ -422,6 +492,46 @@ final class CodexClient {
            let params = obj["params"] as? [String: Any] {
             handleNotification(method: method, params: params)
             return
+        }
+    }
+
+    private static func requestId(from value: Any?) -> Int64? {
+        if let id = value as? Int64 { return id }
+        if let id = value as? Int { return Int64(id) }
+        if let id = value as? NSNumber { return id.int64Value }
+        return nil
+    }
+
+    private func handleServerRequest(id: Any, method: String, params: [String: Any]) {
+        switch method {
+        case "account/chatgptAuthTokens/refresh":
+            Task { [weak self] in
+                guard let self else { return }
+                do {
+                    guard let refresh = self.onChatGPTAuthTokensRefresh else {
+                        throw CodexError.serverError("ChatGPT token refresh is not configured")
+                    }
+                    let result = try await refresh(
+                        params["previousAccountId"] as? String,
+                        params["reason"] as? String ?? "unknown"
+                    )
+                    try await self.sendServerResponse(
+                        id: id,
+                        result: [
+                            "accessToken": result.accessToken,
+                            "chatgptAccountId": result.accountId,
+                            "chatgptPlanType": result.planType ?? NSNull()
+                        ]
+                    )
+                } catch {
+                    await self.sendServerError(id: id, message: error.localizedDescription)
+                }
+            }
+
+        default:
+            Task { [weak self] in
+                await self?.sendServerError(id: id, message: "Unsupported server request: \(method)")
+            }
         }
     }
     

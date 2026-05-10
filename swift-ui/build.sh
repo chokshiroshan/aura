@@ -4,12 +4,13 @@ set -e
 SCRIPT_DIR="$(cd "$(dirname "$0")" && pwd)"
 cd "$SCRIPT_DIR"
 
-APP_NAME="Orb"
-BUNDLE_ID="ai.orb.desktop"
+APP_NAME="Aura"
+BUNDLE_ID="ai.aura.desktop"
 VERSION="0.1.0"
 BUILD_NUM="1"
 BINARY=".build/release/Aura"
 APP_BUNDLE="build/${APP_NAME}.app"
+CODEX_APP_SERVER_PATH="${CODEX_APP_SERVER_PATH:-}"
 
 # --- Clean ---
 if [[ "$1" == "clean" ]]; then
@@ -36,12 +37,34 @@ fi
 
 # --- .app Bundle ---
 echo "🏗️  Creating .app bundle..."
+rm -rf "build/Orb.app"
 rm -rf "$APP_BUNDLE"
 mkdir -p "$APP_BUNDLE/Contents/MacOS"
 mkdir -p "$APP_BUNDLE/Contents/Resources"
 
 cp "$BINARY" "$APP_BUNDLE/Contents/MacOS/$APP_NAME"
 chmod +x "$APP_BUNDLE/Contents/MacOS/$APP_NAME"
+
+if [[ -z "$CODEX_APP_SERVER_PATH" ]]; then
+    for candidate in \
+        "$HOME/codex-source/codex-rs/target/aarch64-apple-darwin/release/codex-app-server" \
+        "$HOME/codex-source/codex-rs/target/release/codex-app-server"; do
+        if [[ -x "$candidate" ]]; then
+            CODEX_APP_SERVER_PATH="$candidate"
+            break
+        fi
+    done
+fi
+
+if [[ ! -x "$CODEX_APP_SERVER_PATH" ]]; then
+    echo "❌ codex-app-server not found. Build it with:"
+    echo "   cargo build --release -p codex-app-server"
+    echo "   or set CODEX_APP_SERVER_PATH=/path/to/codex-app-server"
+    exit 1
+fi
+
+cp "$CODEX_APP_SERVER_PATH" "$APP_BUNDLE/Contents/MacOS/codex-app-server"
+chmod +x "$APP_BUNDLE/Contents/MacOS/codex-app-server"
 
 # Info.plist
 cat > "$APP_BUNDLE/Contents/Info.plist" << PLIST
@@ -70,11 +93,11 @@ cat > "$APP_BUNDLE/Contents/Info.plist" << PLIST
     <key>LSUIElement</key>
     <true/>
     <key>NSMicrophoneUsageDescription</key>
-    <string>Orb needs microphone access for voice interaction.</string>
+    <string>Aura needs microphone access for voice interaction.</string>
     <key>NSAppleEventsUsageDescription</key>
-    <string>Orb needs accessibility access for screen awareness and text injection.</string>
+    <string>Aura needs accessibility access for screen awareness and text injection.</string>
     <key>NSScreenCaptureUsageDescription</key>
-    <string>Orb needs screen capture to see what you're working on.</string>
+    <string>Aura needs screen capture to see what you're working on.</string>
     <key>NSHighResolutionCapable</key>
     <true/>
 </dict>
@@ -84,10 +107,30 @@ PLIST
 echo -n "APPL????" > "$APP_BUNDLE/Contents/PkgInfo"
 
 # Code sign
+# Use a stable signing identity when available so macOS TCC permissions survive
+# rebuilds. Ad-hoc signing changes the code identity on every build.
+SIGN_IDENTITY="${CODE_SIGN_IDENTITY:-}"
+if [[ -z "$SIGN_IDENTITY" ]]; then
+    SIGN_IDENTITY="$(
+        security find-identity -v -p codesigning 2>/dev/null \
+            | awk -F'"' '/Developer ID Application:/ { print $2; exit }'
+    )"
+fi
+if [[ -z "$SIGN_IDENTITY" ]]; then
+    SIGN_IDENTITY="$(
+        security find-identity -v -p codesigning 2>/dev/null \
+            | awk -F'"' '/Apple Development:|Local Code Signing/ { print $2; exit }'
+    )"
+fi
+if [[ -z "$SIGN_IDENTITY" ]]; then
+    SIGN_IDENTITY="-"
+fi
+
+echo "🔏 Signing with ${SIGN_IDENTITY}"
 if [[ -f "Aura.entitlements" ]]; then
-    codesign --force --deep --sign - --entitlements Aura.entitlements "$APP_BUNDLE" 2>/dev/null || true
+    codesign --force --deep --sign "$SIGN_IDENTITY" --entitlements Aura.entitlements "$APP_BUNDLE"
 else
-    codesign --force --deep --sign - "$APP_BUNDLE" 2>/dev/null || true
+    codesign --force --deep --sign "$SIGN_IDENTITY" "$APP_BUNDLE"
 fi
 
 APP_SIZE=$(du -sh "$APP_BUNDLE" | cut -f1)

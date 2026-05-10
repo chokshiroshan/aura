@@ -30,6 +30,7 @@ final class AuraCoordinator: ObservableObject {
     @Published var conversationHistory: [ChatMessage] = []
     @Published var activeNudge: NudgeEngine.Nudge?
     @Published var proactivityLevel: NudgeEngine.ProactivityLevel = .silent
+    @Published private(set) var isVoiceSessionActive = false
     
     // MARK: - Components
     private let codex = CodexClient()
@@ -47,6 +48,7 @@ final class AuraCoordinator: ObservableObject {
     private var scanResponseBuffers: [String: String] = [:]
     private let attachScreenToTextTurns = true
     private var realtimeScreenTimer: Timer?
+    private var pendingRealtimeStartThreadId: String?
     
     // MARK: - Setup
     
@@ -136,11 +138,28 @@ final class AuraCoordinator: ObservableObject {
             }
         }
 
+        codex.onChatGPTAuthTokensRefresh = { _, reason in
+            let refreshed = await ChatGPTAuth.shared.refreshAccessToken(force: reason == "unauthorized")
+            guard refreshed,
+                  let tokens = KeychainStore.shared.loadTokens(),
+                  let accountId = tokens.chatgptAccountId else {
+                throw AuthError.authFailed("Could not refresh ChatGPT auth tokens")
+            }
+            return CodexClient.ChatGPTAuthTokensRefreshResult(
+                accessToken: tokens.accessToken,
+                accountId: accountId,
+                planType: tokens.plan
+            )
+        }
+
         codex.onRealtimeStarted = { [weak self] threadId in
             Task { @MainActor in
                 guard let self, threadId == self.currentThreadId else { return }
                 self.isRealtimeActive = true
+                self.isVoiceSessionActive = true
+                self.pendingRealtimeStartThreadId = nil
                 self.orbState = .listening
+                self.startRealtimeAudioIO(threadId: threadId)
             }
         }
 
@@ -200,8 +219,14 @@ final class AuraCoordinator: ObservableObject {
     
     private func launchCodexBinary() {
         let bundle = Bundle.main
+        let executableCodexPath = bundle.executableURL?
+            .deletingLastPathComponent()
+            .appendingPathComponent("codex-app-server")
+            .path
         let codexPath = bundle.path(forResource: "codex-app-server", ofType: nil)
-            ?? bundle.path(forResource: "codex-app-server", ofType: nil, inDirectory: "Contents/MacOS")
+            ?? executableCodexPath.flatMap {
+                FileManager.default.isExecutableFile(atPath: $0) ? $0 : nil
+            }
         
         guard let binaryPath = codexPath else {
             connectionState = .error("Codex binary not found")
@@ -323,28 +348,21 @@ final class AuraCoordinator: ObservableObject {
     // MARK: - Voice
     
     func startVoiceConversation() {
-        guard let threadId = currentThreadId else { return }
-        guard !isRealtimeActive else { return }
+        guard let threadId = currentThreadId else {
+            conversationHistory.append(ChatMessage(role: .error, content: "Voice unavailable: no active conversation thread yet."))
+            return
+        }
+        guard !isVoiceSessionActive, pendingRealtimeStartThreadId == nil else { return }
         
-        orbState = .listening
+        orbState = .processing
+        pendingRealtimeStartThreadId = threadId
         
         Task {
             do {
                 try await codex.startRealtime(threadId: threadId)
-
-                isRealtimeActive = true
-                sendRealtimeScreenSnapshot(threadId: threadId, reason: "voice session started")
-                startRealtimeScreenSnapshots(threadId: threadId)
-                audioPlayer.start()
-
-                audioCapture.onAudioData = { [weak self] pcmData in
-                    Task { @MainActor in
-                        guard let self, let threadId = self.currentThreadId else { return }
-                        try? await self.codex.appendAudio(threadId: threadId, pcmData: pcmData)
-                    }
-                }
-                try audioCapture.start()
+                self.failRealtimeStartIfNeeded(threadId: threadId)
             } catch {
+                self.pendingRealtimeStartThreadId = nil
                 self.failVoiceConversation(error.localizedDescription)
             }
         }
@@ -361,6 +379,38 @@ final class AuraCoordinator: ObservableObject {
         Task {
             try? await codex.stopRealtime(threadId: threadId)
             self.endVoiceLocally()
+        }
+    }
+
+    private func failRealtimeStartIfNeeded(threadId: String) {
+        Task {
+            try? await Task.sleep(for: .seconds(8))
+            guard self.pendingRealtimeStartThreadId == threadId else { return }
+            self.pendingRealtimeStartThreadId = nil
+            self.failVoiceConversation("Timed out waiting for realtime session to start.")
+        }
+    }
+
+    private func startRealtimeAudioIO(threadId: String) {
+        sendRealtimeScreenSnapshot(threadId: threadId, reason: "voice session started")
+        startRealtimeScreenSnapshots(threadId: threadId)
+        audioPlayer.start()
+
+        audioCapture.onAudioData = { [weak self] pcmData in
+            Task { @MainActor in
+                guard let self, threadId == self.currentThreadId, self.isRealtimeActive else { return }
+                do {
+                    try await self.codex.appendAudio(threadId: threadId, pcmData: pcmData)
+                } catch {
+                    print("⚠️ Failed to append realtime audio: \(error.localizedDescription)")
+                }
+            }
+        }
+
+        do {
+            try audioCapture.start()
+        } catch {
+            failVoiceConversation(error.localizedDescription)
         }
     }
 
@@ -395,6 +445,8 @@ final class AuraCoordinator: ObservableObject {
         realtimeScreenTimer?.invalidate()
         realtimeScreenTimer = nil
         isRealtimeActive = false
+        isVoiceSessionActive = false
+        pendingRealtimeStartThreadId = nil
         orbState = .idle
     }
 
@@ -501,15 +553,60 @@ final class AuraCoordinator: ObservableObject {
     // MARK: - Login
     
     func loginWithChatGPT() {
+        beginChatGPTLogin()
+    }
+
+    func switchChatGPTAccount() {
+        Task {
+            await clearCurrentAccount()
+            beginChatGPTLogin()
+        }
+    }
+
+    func signOut() {
+        Task {
+            await clearCurrentAccount()
+        }
+    }
+
+    func reconnect() {
+        shutdown()
+        currentThreadId = nil
+        connectionState = .connecting
+        startCodexAndConnect()
+    }
+
+    private func beginChatGPTLogin() {
         Task {
             do {
-                let result = try await codex.loginAccount()
-                if let url = result.loginUrl, let url = URL(string: url) {
-                    NSWorkspace.shared.open(url)
+                let tokens = try await ChatGPTAuth.shared.signInAndWait()
+                guard let accountId = tokens.chatgptAccountId else {
+                    throw AuthError.authFailed("ChatGPT token did not include an account id")
                 }
+                try await codex.loginWithChatGPTAuthTokens(
+                    accessToken: tokens.accessToken,
+                    accountId: accountId,
+                    planType: tokens.plan
+                )
+                await refreshAccountAndStart()
             } catch {
                 print("❌ Login failed: \(error)")
+                connectionState = .error(error.localizedDescription)
             }
+        }
+    }
+
+    private func clearCurrentAccount() async {
+        ChatGPTAuth.shared.signOut()
+        do {
+            try await codex.logoutAccount()
+            accountEmail = nil
+            accountPlan = nil
+            currentThreadId = nil
+            conversationHistory.removeAll()
+            connectionState = .authenticating
+        } catch {
+            connectionState = .error(error.localizedDescription)
         }
     }
     
@@ -571,7 +668,11 @@ final class AuraCoordinator: ObservableObject {
         audioCapture.stop()
         audioPlayer.stop()
         codex.disconnect()
-        codexProcess?.terminate()
+        if let process = codexProcess {
+            process.terminate()
+            process.waitUntilExit()
+            codexProcess = nil
+        }
     }
 }
 

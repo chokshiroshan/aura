@@ -54,70 +54,9 @@ final class ChatGPTAuth: @unchecked Sendable, ObservableObject {
 
     func signIn() {
         guard authState != .signingIn else { return }
-        DispatchQueue.main.async {
-            self.authState = .signingIn
-        }
-
-        Task { @MainActor in
+        Task {
             do {
-                // Generate PKCE (matching Codex: URL-safe base64 no-pad, 64 random bytes)
-                let verifier = Self.generateCodeVerifier()
-                let challenge = Self.generateCodeChallenge(from: verifier)
-                let state = Self.randomState()
-
-                // Start callback server on port 1455 (Codex standard), falls back to random
-                let server = OAuthCallbackServer()
-                server.path = redirectPath
-                self.callbackServer = server
-                let port = try server.start(fixedPort: callbackPort)
-                let redirectURI = "http://localhost:\(port)\(redirectPath)"
-
-                // Build authorize URL — matching Codex's build_authorize_url() exactly
-                var components = URLComponents(string: "\(issuer)/oauth/authorize")!
-                components.queryItems = [
-                    URLQueryItem(name: "response_type", value: "code"),
-                    URLQueryItem(name: "client_id", value: clientID),
-                    URLQueryItem(name: "redirect_uri", value: redirectURI),
-                    URLQueryItem(name: "scope", value: scopes),
-                    URLQueryItem(name: "code_challenge", value: challenge),
-                    URLQueryItem(name: "code_challenge_method", value: "S256"),
-                    URLQueryItem(name: "id_token_add_organizations", value: "true"),
-                    URLQueryItem(name: "codex_cli_simplified_flow", value: "true"),
-                    URLQueryItem(name: "state", value: state),
-                    URLQueryItem(name: "originator", value: "codex_cli_rs"),
-                ]
-
-                guard let authURL = components.url else {
-                    throw AuthError.serverFailed
-                }
-
-                print("🌐 Opening OAuth: \(authURL)")
-                NSWorkspace.shared.open(authURL)
-
-                // Wait for callback with auth code
-                let result = try await server.waitForCallback()
-                server.stop()
-                self.callbackServer = nil
-
-                guard result.state == state else {
-                    throw AuthError.authFailed("State mismatch")
-                }
-
-                // Exchange code for tokens (form-urlencoded, matching Codex)
-                let tokens = try await exchangeCode(result.code, verifier: verifier, redirectURI: redirectURI)
-
-                self.accessToken = tokens.accessToken
-                let email = Self.extractEmailFromJWT(tokens.accessToken)
-
-                try keychain.saveTokens(tokens)
-
-                let displayEmail = email ?? "ChatGPT User"
-                DispatchQueue.main.async {
-                    self.userEmail = displayEmail
-                    self.authState = .signedIn(email: displayEmail, plan: "ChatGPT")
-                }
-                print("✅ Authenticated as \(displayEmail) (refresh token: \(tokens.refreshToken.isEmpty ? "NO" : "YES"))")
-
+                _ = try await self.signInAndWait()
             } catch {
                 print("❌ Auth failed: \(error)")
                 self.callbackServer?.stop()
@@ -126,6 +65,74 @@ final class ChatGPTAuth: @unchecked Sendable, ObservableObject {
                     self.authState = .error(error.localizedDescription)
                 }
             }
+        }
+    }
+
+    @MainActor
+    func signInAndWait() async throws -> KeychainStore.AuthTokens {
+        guard authState != .signingIn else {
+            throw AuthError.authFailed("A sign-in is already in progress")
+        }
+        authState = .signingIn
+
+        // Generate PKCE (matching Codex: URL-safe base64 no-pad, 64 random bytes)
+        let verifier = Self.generateCodeVerifier()
+        let challenge = Self.generateCodeChallenge(from: verifier)
+        let state = Self.randomState()
+
+        // Start callback server on port 1455 (Codex standard), falling back to random.
+        let server = OAuthCallbackServer()
+        server.path = redirectPath
+        self.callbackServer = server
+        let port = try server.start(fixedPort: callbackPort)
+        let redirectURI = "http://localhost:\(port)\(redirectPath)"
+
+        // Build authorize URL with a localhost callback owned by Aura. This avoids
+        // Codex.app deep-link callbacks and the "Open Codex?" browser prompt.
+        var components = URLComponents(string: "\(issuer)/oauth/authorize")!
+        components.queryItems = [
+            URLQueryItem(name: "response_type", value: "code"),
+            URLQueryItem(name: "client_id", value: clientID),
+            URLQueryItem(name: "redirect_uri", value: redirectURI),
+            URLQueryItem(name: "scope", value: scopes),
+            URLQueryItem(name: "code_challenge", value: challenge),
+            URLQueryItem(name: "code_challenge_method", value: "S256"),
+            URLQueryItem(name: "id_token_add_organizations", value: "true"),
+            URLQueryItem(name: "codex_cli_simplified_flow", value: "true"),
+            URLQueryItem(name: "state", value: state),
+            URLQueryItem(name: "originator", value: "codex_cli_rs"),
+        ]
+
+        guard let authURL = components.url else {
+            throw AuthError.serverFailed
+        }
+
+        print("🌐 Opening OAuth: \(authURL)")
+        NSWorkspace.shared.open(authURL)
+
+        do {
+            let result = try await server.waitForCallback()
+            server.stop()
+            self.callbackServer = nil
+
+            guard result.state == state else {
+                throw AuthError.authFailed("State mismatch")
+            }
+
+            let tokens = try await exchangeCode(result.code, verifier: verifier, redirectURI: redirectURI)
+            self.accessToken = tokens.accessToken
+            try keychain.saveTokens(tokens)
+
+            let displayEmail = tokens.email ?? "ChatGPT User"
+            self.userEmail = displayEmail
+            self.authState = .signedIn(email: displayEmail, plan: tokens.plan ?? "ChatGPT")
+            print("✅ Authenticated as \(displayEmail) (refresh token: \(tokens.refreshToken.isEmpty ? "NO" : "YES"))")
+            return tokens
+        } catch {
+            server.stop()
+            self.callbackServer = nil
+            self.authState = .error(error.localizedDescription)
+            throw error
         }
     }
 
@@ -141,14 +148,14 @@ final class ChatGPTAuth: @unchecked Sendable, ObservableObject {
     // MARK: - Token Refresh
 
     @discardableResult
-    func refreshAccessToken() async -> Bool {
+    func refreshAccessToken(force: Bool = false) async -> Bool {
         guard let tokens = keychain.loadTokens(),
               !tokens.refreshToken.isEmpty else {
             return false
         }
 
         // If not expired, just return current token
-        if !tokens.isExpired {
+        if !force && !tokens.isExpired {
             accessToken = tokens.accessToken
             return true
         }
@@ -230,10 +237,15 @@ final class ChatGPTAuth: @unchecked Sendable, ObservableObject {
         let refreshToken = json["refresh_token"] as? String ?? ""
         let expiresIn = json["expires_in"] as? TimeInterval ?? 3600
         let idToken = json["id_token"] as? String
-        let email = Self.extractEmailFromJWT(accessToken)
+        let email = Self.extractEmailFromJWT(idToken ?? accessToken)
+        let accountId = idToken.flatMap { Self.extractAuthClaim("chatgpt_account_id", from: $0) }
+            ?? Self.extractAuthClaim("chatgpt_account_id", from: accessToken)
+        let plan = idToken.flatMap { Self.extractAuthClaim("chatgpt_plan_type", from: $0) }
+            ?? Self.extractAuthClaim("chatgpt_plan_type", from: accessToken)
 
         print("📋 Token response scopes: \(json["scope"] ?? "none")")
         print("📋 Refresh token present: \(!refreshToken.isEmpty)")
+        print("📋 ChatGPT account id present: \(accountId == nil ? "NO" : "YES")")
 
         return KeychainStore.AuthTokens(
             accessToken: accessToken,
@@ -241,7 +253,8 @@ final class ChatGPTAuth: @unchecked Sendable, ObservableObject {
             idToken: idToken,
             expiresAt: Date().addingTimeInterval(expiresIn - 60),
             email: email,
-            plan: "ChatGPT"
+            plan: plan ?? "ChatGPT",
+            chatgptAccountId: accountId
         )
     }
 
@@ -277,7 +290,11 @@ final class ChatGPTAuth: @unchecked Sendable, ObservableObject {
         let newRefreshToken = json["refresh_token"] as? String ?? refreshToken
         let expiresIn = json["expires_in"] as? TimeInterval ?? 3600
         let idToken = json["id_token"] as? String
-        let email = Self.extractEmailFromJWT(accessToken)
+        let email = Self.extractEmailFromJWT(idToken ?? accessToken)
+        let accountId = idToken.flatMap { Self.extractAuthClaim("chatgpt_account_id", from: $0) }
+            ?? Self.extractAuthClaim("chatgpt_account_id", from: accessToken)
+        let plan = idToken.flatMap { Self.extractAuthClaim("chatgpt_plan_type", from: $0) }
+            ?? Self.extractAuthClaim("chatgpt_plan_type", from: accessToken)
 
         return KeychainStore.AuthTokens(
             accessToken: accessToken,
@@ -285,7 +302,8 @@ final class ChatGPTAuth: @unchecked Sendable, ObservableObject {
             idToken: idToken,
             expiresAt: Date().addingTimeInterval(expiresIn - 60),
             email: email,
-            plan: "ChatGPT"
+            plan: plan ?? "ChatGPT",
+            chatgptAccountId: accountId
         )
     }
 
@@ -324,6 +342,20 @@ final class ChatGPTAuth: @unchecked Sendable, ObservableObject {
     // MARK: - JWT Parsing
 
     static func extractEmailFromJWT(_ jwt: String) -> String? {
+        let claims = jwtClaims(jwt)
+        let profile = claims?["https://api.openai.com/profile"] as? [String: Any]
+        return claims?["email"] as? String
+            ?? claims?["name"] as? String
+            ?? profile?["email"] as? String
+    }
+
+    static func extractAuthClaim(_ key: String, from jwt: String) -> String? {
+        guard let claims = jwtClaims(jwt) else { return nil }
+        let auth = claims["https://api.openai.com/auth"] as? [String: Any]
+        return auth?[key] as? String ?? claims[key] as? String
+    }
+
+    private static func jwtClaims(_ jwt: String) -> [String: Any]? {
         let parts = jwt.split(separator: ".")
         guard parts.count >= 2 else { return nil }
 
@@ -338,7 +370,7 @@ final class ChatGPTAuth: @unchecked Sendable, ObservableObject {
             return nil
         }
 
-        return json["email"] as? String ?? json["name"] as? String
+        return json
     }
 }
 

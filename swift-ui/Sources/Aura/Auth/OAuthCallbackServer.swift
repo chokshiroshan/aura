@@ -31,8 +31,7 @@ final class OAuthCallbackServer {
     }
 
     /// Start the server on a specific or random port. Returns the port used.
-    /// If the fixed port is taken, tries to kill the stale process and retry,
-    /// then falls back to a random port.
+    /// If the fixed port is taken, falls back to a random port.
     func start(fixedPort: UInt16? = nil) throws -> UInt16 {
         self.fixedPort = fixedPort
 
@@ -42,22 +41,10 @@ final class OAuthCallbackServer {
             return port
         } catch {
             if fixedPort != nil {
-                // Try to kill any stale process on that port
-                if let port = fixedPort {
-                    _ = shell("lsof -ti :\(port) | xargs kill -9 2>/dev/null")
-                    Thread.sleep(forTimeInterval: 0.3)
-                }
-                // Retry fixed port
-                do {
-                    try bindAndListen()
-                    return port
-                } catch {
-                    // Fall back to random port
-                    print("⚠️ Port \(fixedPort!) taken, using random port")
-                    self.fixedPort = nil
-                    try bindAndListen()
-                    return port
-                }
+                print("⚠️ Port \(fixedPort!) taken, using random port")
+                self.fixedPort = nil
+                try bindAndListen()
+                return port
             }
             throw error
         }
@@ -89,18 +76,6 @@ final class OAuthCallbackServer {
 
     // MARK: - Private
 
-    private func shell(_ cmd: String) -> String {
-        let process = Process()
-        let pipe = Pipe()
-        process.executableURL = URL(fileURLWithPath: "/bin/bash")
-        process.arguments = ["-c", cmd]
-        process.standardOutput = pipe
-        try? process.run()
-        process.waitUntilExit()
-        let data = pipe.fileHandleForReading.readDataToEndOfFile()
-        return String(data: data, encoding: .utf8) ?? ""
-    }
-
     /// Bind the socket and start listening. Only call once.
     private func bindAndListen() throws {
         guard serverSocket == -1 else { return } // Already bound
@@ -114,11 +89,11 @@ final class OAuthCallbackServer {
         var reuse: Int32 = 1
         setsockopt(serverSocket, SOL_SOCKET, SO_REUSEADDR, &reuse, socklen_t(MemoryLayout.size(ofValue: reuse)))
 
-        // Bind to localhost on specified or random port
+        // Bind only to loopback; the OAuth redirect URI is localhost.
         var addr = sockaddr_in()
         addr.sin_len = UInt8(MemoryLayout.size(ofValue: addr))
         addr.sin_family = sa_family_t(AF_INET)
-        addr.sin_addr.s_addr = INADDR_ANY  // 0.0.0.0 — works with both localhost and 127.0.0.1
+        addr.sin_addr.s_addr = inet_addr("127.0.0.1")
         addr.sin_port = fixedPort.map { $0.bigEndian } ?? 0
 
         let bindResult = withUnsafePointer(to: addr) { ptr in
@@ -187,7 +162,7 @@ final class OAuthCallbackServer {
                 self.sendResponse(clientSocket, html: """
                 <html><body style="font-family:system-ui;text-align:center;padding-top:15%">
                 <h2>✅ Authenticated!</h2>
-                <p>You can close this tab and go back to ChatFlow.</p>
+                <p>You can close this tab and go back to Aura.</p>
                 <script>setTimeout(() => window.close(), 1500)</script>
                 </body></html>
                 """)

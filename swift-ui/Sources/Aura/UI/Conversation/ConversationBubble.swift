@@ -98,9 +98,9 @@ struct ConversationBubble: View {
             // Input bar
             HStack(spacing: 10) {
                 Button(action: toggleVoice) {
-                    Image(systemName: coordinator.orbState == .listening ? "waveform.circle.fill" : "mic.circle")
+                    Image(systemName: coordinator.isVoiceSessionActive ? "waveform.circle.fill" : "mic.circle")
                         .font(.system(size: 20))
-                        .foregroundColor(coordinator.orbState == .listening ? .cyan : .white.opacity(0.4))
+                        .foregroundColor(coordinator.isVoiceSessionActive ? .cyan : .white.opacity(0.4))
                 }
                 .buttonStyle(.plain)
                 
@@ -152,9 +152,10 @@ struct ConversationBubble: View {
     }
     
     private func toggleVoice() {
-        switch coordinator.orbState {
-        case .listening: coordinator.stopVoiceConversation()
-        default: coordinator.startVoiceConversation()
+        if coordinator.isVoiceSessionActive {
+            coordinator.stopVoiceConversation()
+        } else {
+            coordinator.startVoiceConversation()
         }
     }
 }

@@ -24,6 +24,7 @@ struct SettingsView: View {
 private struct GeneralSettingsView: View {
     @ObservedObject var coordinator: AuraCoordinator
     @State private var permissions = PermissionsManager.shared.checkAll()
+    private let permissionPoller = Timer.publish(every: 1.0, on: .main, in: .common).autoconnect()
     
     var body: some View {
         Form {
@@ -89,6 +90,9 @@ private struct GeneralSettingsView: View {
         .formStyle(.grouped)
         .padding()
         .onAppear {
+            permissions = PermissionsManager.shared.checkAll()
+        }
+        .onReceive(permissionPoller) { _ in
             permissions = PermissionsManager.shared.checkAll()
         }
     }

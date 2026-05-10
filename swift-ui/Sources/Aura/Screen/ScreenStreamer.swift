@@ -84,7 +84,6 @@ final class ScreenStreamer {
     private func captureScreen() -> CGImage? {
         if !PermissionsManager.shared.checkScreenRecording() {
             print("⚠️ Screen Recording permission is not granted")
-            _ = PermissionsManager.shared.requestScreenRecording()
             return nil
         }
 

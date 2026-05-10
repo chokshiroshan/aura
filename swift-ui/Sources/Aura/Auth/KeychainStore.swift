@@ -22,6 +22,7 @@ final class KeychainStore {
         let expiresAt: Date
         let email: String?
         let plan: String?
+        let chatgptAccountId: String?
 
         var isExpired: Bool {
             Date() > expiresAt.addingTimeInterval(-60) // 60s buffer
